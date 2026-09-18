@@ -12,8 +12,8 @@ from mmdbridge_vmd import *
 
 
 # --- Bone Animation Settings ---
-# Export FK bone animation
-export_fk_bone_animation = True
+# Export physics bone animation
+export_physics_bone_animation = True
 # FK bone animation export mode
 # 0: Simulated physics bones only
 # 1: All FK bones. Exclude 付与親 and Bone Morph influences from bone animation. (For MMD / MMD Tools, which re-apply them at runtime)
@@ -81,7 +81,7 @@ end_frame = int((mmd_end_frame + 1) * ratio) - 1
 framenumber = get_frame_number()
 
 # Check if there is anything to export
-is_anything_to_export = export_fk_bone_animation or export_ik_bone_animation or export_morph_animation
+is_anything_to_export = export_physics_bone_animation or export_ik_bone_animation or export_morph_animation
 
 if is_anything_to_export:
     if framenumber == start_frame:
@@ -98,7 +98,7 @@ if is_anything_to_export:
             pass
 
         start_vmd_export(
-            export_fk_bone_animation_mode=export_fk_bone_animation_mode if export_fk_bone_animation else -1,  # Pass -1 if FK is off
+            export_fk_bone_animation_mode=export_fk_bone_animation_mode if export_physics_bone_animation else -1,  # Pass -1 if FK is off
             export_ik_bone_animation=export_ik_bone_animation,
             add_turn_off_ik_keyframe=add_turn_off_ik_keyframe,
             export_morph_animation=export_morph_animation,

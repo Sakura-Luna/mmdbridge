@@ -10,6 +10,7 @@
 #include "UMStringUtil.h"
 #include "UMPath.h"
 
+#include <cmath>
 #include <map>
 #include <vector>
 
@@ -76,6 +77,7 @@ public:
 	std::map<int, int> ik_frame_bone_map;
 	std::map<int, int> fuyo_bone_map;
 	std::map<int, int> fuyo_target_map;
+	std::unordered_map<int, vmd::VmdBoneFrame> last_bone_frame;
 	// morph (face)
 	std::map<int, std::string> morph_name_map;
 
@@ -880,11 +882,12 @@ static bool execute_vmd_export(const int currentframe)
 				{
 					continue;
 				}
-			}
-			else // This is an FK bone
-			{
-				if (!is_simulated_physics_bone && archive.export_fk_bone_animation_mode == 0) // 0: Simulated physics bones only
-				{
+			} else { // This is an FK bone
+				if (is_simulated_physics_bone) {
+					if (archive.export_fk_bone_animation_mode < 0) {
+						continue;
+					}
+				} else if (archive.export_fk_bone_animation_mode == 0) { // 0: Simulated physics bones only
 					continue;
 				}
 			}
@@ -892,8 +895,9 @@ static bool execute_vmd_export(const int currentframe)
 			// Use helper function to calculate bone frame
 			vmd::VmdBoneFrame bone_frame = calculate_bone_frame(i, k, currentframe, file_data);
 
-			if (archive.export_fk_bone_animation_mode == 1) // 1: All FK bones. Exclude 付与親 and Bone Morph influences from bone animation. (For MMD / MMD Tools, which re-apply them at runtime)
-			{
+			// -1: Only FK bones.
+			// 1: All FK bones. Exclude 付与親 and Bone Morph influences from bone animation. (For MMD / MMD Tools, which re-apply them at runtime)
+			if (std::abs(archive.export_fk_bone_animation_mode) == 1) {
 				// Remove grant parent influence
 				if (file_data.pmx && k < static_cast<int>(file_data.pmx->bones.size()))
 				{
@@ -1117,7 +1121,23 @@ static bool execute_vmd_export(const int currentframe)
 				// The FK animation is already baked, do nothing
 			}
 
-			file_data.vmd->bone_frames.push_back(bone_frame);
+			// Simplify animations
+			if (file_data.last_bone_frame.find(k) == file_data.last_bone_frame.end()) {
+				file_data.vmd->bone_frames.push_back(bone_frame);
+				file_data.last_bone_frame[k] = bone_frame;
+			} else {
+				vmd::VmdBoneFrame& last_frame = file_data.last_bone_frame[k];
+				if (std::pow(bone_frame.position[0] - last_frame.position[0], 2) +
+						std::pow(bone_frame.position[1] - last_frame.position[1], 2) +
+						std::pow(bone_frame.position[2] - last_frame.position[2], 2) > 1e-8f ||
+					std::abs(bone_frame.orientation[0] * last_frame.orientation[0] +
+							 bone_frame.orientation[1] * last_frame.orientation[1] +
+							 bone_frame.orientation[2] * last_frame.orientation[2] +
+							 bone_frame.orientation[3] * last_frame.orientation[3]) < 1 - 1e-5f) {
+								file_data.vmd->bone_frames.push_back(bone_frame);
+								file_data.last_bone_frame[k] = bone_frame;
+				}
+			}
 		}
 
 		// Handle IK frames for the first frame

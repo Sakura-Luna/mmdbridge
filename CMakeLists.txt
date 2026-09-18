@@ -71,6 +71,7 @@ add_subdirectory(src)
 set_directory_properties(PROPERTIES VS_STARTUP_PROJECT d3d9)
 
 # install runtime dependencies
+option(ZLIB_BUILD_ZLIB1_DLL "Build the legacy zlib + minizip DLL" ON)
 install(TARGETS d3d9 d3dx9_43 RUNTIME DESTINATION ${MMD_DIR})
 install(FILES $<TARGET_RUNTIME_DLLS:d3d9> DESTINATION ${MMD_DIR})
 # install(FILES $<TARGET_RUNTIME_DLLS:Alembic::Alembic> DESTINATION ${MMD_DIR})
@@ -80,7 +81,6 @@ install(FILES $<TARGET_RUNTIME_DLLS:d3d9> DESTINATION ${MMD_DIR})
 set(MISSING_DLLS_RELEASE
     "${CMAKE_INSTALL_PREFIX}/bin/hdf5.dll"
     "${CMAKE_INSTALL_PREFIX}/bin/szip.dll"
-    "${CMAKE_INSTALL_PREFIX}/bin/zlib1.dll"
 )
 install(
     FILES ${MISSING_DLLS_RELEASE}
@@ -91,7 +91,6 @@ install(
 set(MISSING_DLLS_DEBUG
     "${CMAKE_INSTALL_PREFIX}/debug/bin/hdf5_D.dll"
     "${CMAKE_INSTALL_PREFIX}/debug/bin/szip.dll"
-    "${CMAKE_INSTALL_PREFIX}/debug/bin/zlibd1.dll"
 )
 install(
     FILES ${MISSING_DLLS_DEBUG}
