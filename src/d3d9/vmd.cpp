@@ -554,8 +554,10 @@ static bool end_gltf_export() {
 		file_data.vmd->bone_frames = PostProcessKeyframes(
 			file_data.vmd->bone_frames, get_bone_name, are_bones_equal, is_bone_zero);
 
+		// 【修复 1】删除了直接修改 frame.frame 的危险循环，避免无符号整数下溢。
 		// 偏移计算将统一在下方构建 times 时安全地进行。
-		// 建立从原始 bone_index 到连续 glTF node_index (0 到 N-1) 的显式映射
+
+		// 【修复 2】建立从原始 bone_index 到连续 glTF node_index (0 到 N-1) 的显式映射
 		// 彻底解决骨骼索引不连续导致的 glTF node 数组越界和引用错误
 		std::map<int, int> bone_to_gltf_node;
 		int gltf_node_idx = 0;
@@ -592,7 +594,7 @@ static bool end_gltf_export() {
 
 		auto add_accessor = [&](const std::vector<float>& values, const char* type) {
 			while ((binary.size() & 3) != 0) {
-				binary.push_back('\0'); // glTF 要求 bufferView 4 字节对齐
+				binary.push_back('\0'); // glTF 要求 bufferView 4字节对齐
 			}
 			const size_t offset = binary.size();
 			binary.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));
@@ -624,7 +626,7 @@ static bool end_gltf_export() {
 			std::vector<float> rotations;
 
 			for (const auto *frame: frames) {
-				// 安全的有符号转换，避免无符号下溢，并确保时间不为负
+				// 【修复 1 续】安全的有符号转换，避免无符号下溢，并确保时间不为负
 				int adjusted_frame = static_cast<int>(frame->frame) - start_frame;
 				times.push_back(std::max(0, adjusted_frame) / fps);
 				translations.insert(translations.end(), frame->position, frame->position + 3);
@@ -632,7 +634,7 @@ static bool end_gltf_export() {
 			}
 
 			const int input = add_accessor(times, "SCALAR");
-			// 使用映射后的连续 node 索引
+			// 【修复 2 续】使用映射后的连续 node 索引
 			const int gltf_node = bone_to_gltf_node[bone_index];
 			channels.push_back({input, add_accessor(translations, "VEC3"), gltf_node, "translation"});
 			channels.push_back({input, add_accessor(rotations, "VEC4"), gltf_node, "rotation"});
@@ -650,7 +652,7 @@ static bool end_gltf_export() {
 		wcscpy_s(filename, MAX_PATH, source_name.c_str());
 		PathRenameExtensionW(filename, L".gltf");
 
-		// 安全的文件重名处理，防止原本带有 "(2)" 的文件名导致计数混乱和意外覆盖
+		// 【修复 4】安全的文件重名处理，防止原本带有 "(2)" 的文件名导致计数混乱和意外覆盖
 		std::wstring base_name = filename;
 		size_t dot_pos = base_name.find_last_of(L'.');
 		std::wstring name_without_ext = (dot_pos != std::wstring::npos) ? base_name.substr(0, dot_pos) : base_name;
@@ -674,14 +676,14 @@ static bool end_gltf_export() {
 		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
 			if (file_data.parent_index_map.at(bone_index) < 0) {
 				if (!first_root) json << ',';
-				// 使用映射后的索引作为场景根节点
+				// 【修复 2 续】使用映射后的索引作为场景根节点
 				json << bone_to_gltf_node[bone_index];
 				first_root = false;
 			}
 		}
 		json << "]}],\"nodes\":[";
 
-		// 增加防御性检查，防止 pmd 和 pmx 指针同时为空导致崩溃
+		// 【修复 3】增加防御性检查，防止 pmd 和 pmx 指针同时为空导致崩溃
 		auto get_bone_position = [&](int bone_index, float position[3]) {
 			if (file_data.pmd) {
 				const pmd::PmdBone &bone = file_data.pmd->bones[bone_index];
@@ -728,7 +730,7 @@ static bool end_gltf_export() {
 					} else {
 						json << ',';
 					}
-					// children 数组中必须使用映射后的 glTF node 索引
+					// 【修复 2 续】children 数组中必须使用映射后的 glTF node 索引
 					json << bone_to_gltf_node[child_bone_index];
 				}
 			}
@@ -741,7 +743,7 @@ static bool end_gltf_export() {
 
 		for (size_t index = 0; index < accessors.size(); ++index) {
 			if (index != 0) json << ',';
-			// 直接使用结构体中已计算好的安全字段，摒弃脆弱的字符串索引判断
+			// 【修复 3 续】直接使用结构体中已计算好的安全字段，摒弃脆弱的字符串索引判断
 			const size_t component_count = accessors[index].component_count;
 			json << "{\"buffer\":0,\"byteOffset\":" << accessors[index].offset <<
 				",\"byteLength\":" << accessors[index].count * component_count * sizeof(float) << '}';
@@ -768,7 +770,7 @@ static bool end_gltf_export() {
 			json << "{\"sampler\":" << index << ",\"target\":{\"node\":" <<
 				channels[index].node << ",\"path\":\"" << channels[index].path << "\"}}";
 		}
-		json << "}]}";
+		json << "]}]}";
 
 		std::ofstream output(std::filesystem::path(output_path), std::ios::binary);
 		if (!output) {
