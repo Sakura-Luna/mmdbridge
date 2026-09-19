@@ -11,7 +11,13 @@
 #include "UMPath.h"
 
 #include <cmath>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <map>
+#include <sstream>
+#include <string>
 #include <vector>
 
 #include <pybind11/pybind11.h>
@@ -450,6 +456,319 @@ static bool end_vmd_export()
 
 	VMDArchive::instance().end();
 	return true;
+}
+
+static std::string gltf_json_escape(const std::string &value) {
+    std::ostringstream result;
+    for (unsigned char c : value) {
+        switch (c) {
+            case '\\': result << "\\\\"; break;
+            case '"':  result << "\\\""; break;
+            case '\b': result << "\\b"; break;
+            case '\f': result << "\\f"; break;
+            case '\n': result << "\\n"; break;
+            case '\r': result << "\\r"; break;
+            case '\t': result << "\\t"; break;
+            default:
+                if (c < 0x20) {
+                    // 使用 snprintf 局部格式化，避免污染外层 ostringstream 的 hex/dec 状态
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<int>(c));
+                    result << buf;
+                } else {
+                    result << c;
+                }
+                break;
+        }
+    }
+    return result.str();
+}
+
+static std::string gltf_base64(const std::string &data) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string result;
+    result.reserve((data.size() + 2) / 3 * 4);
+    for (size_t i = 0; i < data.size(); i += 3) {
+        const unsigned int value =
+            (static_cast<unsigned char>(data[i]) << 16) |
+            ((i + 1 < data.size() ? static_cast<unsigned char>(data[i + 1]) : 0) << 8) |
+            (i + 2 < data.size() ? static_cast<unsigned char>(data[i + 2]) : 0);
+        result += alphabet[(value >> 18) & 0x3f];
+        result += alphabet[(value >> 12) & 0x3f];
+        result += i + 1 < data.size() ? alphabet[(value >> 6) & 0x3f] : '=';
+        result += i + 2 < data.size() ? alphabet[value & 0x3f] : '=';
+    }
+    return result;
+}
+
+static void gltf_append_float(std::string &buffer, float value) {
+    // 注意：glTF 规范严格要求二进制数据为小端序 (Little-Endian)。
+    // 此代码假设运行在 x86/x64 架构上。若需支持大端序平台，请在此处添加字节交换逻辑。
+    const char *bytes = reinterpret_cast<const char *>(&value);
+    buffer.append(bytes, sizeof(float));
+}
+
+static bool end_gltf_export() {
+    VMDArchive &archive = VMDArchive::instance();
+    if (!archive.is_start_vmd_export_called) {
+        archive.end();
+        ShowFrameRangeConfigError();
+        return false;
+    }
+    if (archive.has_bone_name_error) {
+        archive.end();
+        ShowInvalidBoneNameError();
+        return false;
+    }
+
+    const int fps = std::max(1, static_cast<int>(std::lround(BridgeParameter::instance().export_fps)));
+    const int start_frame = BridgeParameter::instance().start_frame;
+    const int pmd_num = ExpGetPmdNum();
+
+    // 使用 std::filesystem::path 作为 map 的 key，更安全且原生支持路径比较
+    std::map<std::filesystem::path, int> output_name_counts;
+
+    for (int model_index = 0; model_index < pmd_num; ++model_index) {
+        FileDataForVMD &file_data = archive.data_list.at(model_index);
+        if (!file_data.vmd) {
+            continue;
+        }
+
+        // glTF 动画的输入为秒；这里按导出帧率将 VMD 帧转换为秒。
+        std::map<std::string, std::vector<const vmd::VmdBoneFrame *>> bone_frames;
+        for (const auto &frame : file_data.vmd->bone_frames) {
+            bone_frames[frame.name].push_back(&frame);
+        }
+        for (auto &[name, frames] : bone_frames) {
+            std::sort(frames.begin(), frames.end(), [](const auto *a, const auto *b) {
+                return a->frame < b->frame;
+            });
+        }
+
+        std::vector<std::string> bone_names;
+        for (const auto &[index, name] : file_data.bone_name_map) {
+            if (bone_frames.find(name) != bone_frames.end()) {
+                bone_names.push_back(name);
+            }
+        }
+        for (const auto &[name, frames] : bone_frames) {
+            if (std::find(bone_names.begin(), bone_names.end(), name) == bone_names.end() && !frames.empty()) {
+                bone_names.push_back(name);
+            }
+        }
+
+        std::map<std::string, int> node_indices;
+        for (size_t i = 0; i < bone_names.size(); ++i) {
+            node_indices[bone_names[i]] = static_cast<int>(i);
+        }
+
+        std::string binary;
+
+        // 在 Accessor 中直接存储 component_count，避免后续重复且脆弱的字符串解析
+        struct Accessor {
+            size_t offset;
+            size_t count;
+            const char *type;
+            size_t component_count;
+        };
+        std::vector<Accessor> accessors;
+
+        auto add_accessor = [&](const std::vector<float> &values, const char *type) {
+            while ((binary.size() & 3) != 0) {
+                binary.push_back('\0');
+            }
+            const size_t offset = binary.size();
+            for (float value : values) {
+                gltf_append_float(binary, value);
+            }
+
+            size_t components = 1;
+            std::string_view type_str(type);
+            if (type_str == "VEC3") components = 3;
+            else if (type_str == "VEC4") components = 4;
+            // 若未来支持 MAT4，可在此添加: else if (type_str == "MAT4") components = 16;
+
+            accessors.push_back({offset, values.size() / components, type, components});
+            return static_cast<int>(accessors.size() - 1);
+        };
+
+        struct Channel {
+            int input;
+            int output;
+            int node;
+            const char *path;
+        };
+        std::vector<Channel> channels;
+
+        for (const std::string &name : bone_names) {
+            const auto &frames = bone_frames[name];
+            std::vector<float> times;
+            std::vector<float> translations;
+            std::vector<float> rotations;
+
+            // 预留容量以提升性能
+            times.reserve(frames.size());
+            translations.reserve(frames.size() * 3);
+            rotations.reserve(frames.size() * 4);
+
+            for (const auto *frame : frames) {
+                times.push_back(std::max(0, frame->frame - start_frame) / static_cast<float>(fps));
+                translations.insert(translations.end(), frame->position, frame->position + 3);
+                rotations.insert(rotations.end(), frame->orientation, frame->orientation + 4);
+            }
+
+            const int node = node_indices[name];
+            channels.push_back({add_accessor(times, "SCALAR"), add_accessor(translations, "VEC3"), node, "translation"});
+            channels.push_back({add_accessor(times, "SCALAR"), add_accessor(rotations, "VEC4"), node, "rotation"});
+        }
+
+        // 使用 std::filesystem 彻底替换脆弱的 MAX_PATH 和 Windows API 路径操作
+        const char *filepath = ExpGetPmdFilenameUtf8(model_index);
+        // 保留原有的 UTF-8 到 wstring 转换逻辑，确保中文路径不乱码
+        std::wstring source_path_w = umbase::UMStringUtil::utf16_to_wstring(
+            umbase::UMStringUtil::utf8_to_utf16(filepath));
+
+        std::filesystem::path source_path(source_path_w);
+        std::wstring source_name = source_path.filename().wstring();
+        if (source_name.empty()) {
+            continue;
+        }
+
+        std::filesystem::path base_output_filename = source_path.filename();
+        base_output_filename.replace_extension(L".gltf");
+
+        int count = output_name_counts[base_output_filename]++;
+        if (count > 0) {
+            std::wstring stem = base_output_filename.stem().wstring();
+            std::wstring ext = base_output_filename.extension().wstring();
+            base_output_filename = std::filesystem::path(stem + L" (" + std::to_wstring(count + 1) + L")" + ext);
+        }
+
+        std::filesystem::path output_dir(archive.output_path);
+        std::filesystem::path final_path = output_dir / base_output_filename;
+
+        std::ostringstream json;
+        json << std::setprecision(9);
+        json << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"mmdbridge\"},";
+        json << "\"scene\":0,\"scenes\":[{\"nodes\":[";
+
+        bool first = true;
+        for (const auto &name : bone_names) {
+            // 重写根节点判断逻辑
+            bool has_parent_in_gltf = false;
+            const auto bone_it = std::find_if(file_data.bone_name_map.begin(), file_data.bone_name_map.end(),
+                [&](const auto &item) { return item.second == name; });
+
+            if (bone_it != file_data.bone_name_map.end()) {
+                int parent_idx = file_data.parent_index_map.at(bone_it->first);
+                if (parent_idx >= 0) {
+                    // 查找父节点在 bone_name_map 中的条目
+                    const auto parent_it = std::find_if(file_data.bone_name_map.begin(), file_data.bone_name_map.end(),
+                        [&](const auto &item) { return item.first == parent_idx; });
+
+                    if (parent_it != file_data.bone_name_map.end()) {
+                        // 检查该父节点是否也包含在本次导出的 node_indices 中
+                        if (node_indices.find(parent_it->second) != node_indices.end()) {
+                            has_parent_in_gltf = true;
+                        }
+                    }
+                }
+            }
+
+            if (!has_parent_in_gltf) {
+                if (!first) json << ',';
+                json << node_indices[name];
+                first = false;
+            }
+        }
+
+        json << "]}],\"nodes\":[";
+        for (size_t i = 0; i < bone_names.size(); ++i) {
+            if (i != 0) json << ',';
+            json << "{\"name\":\"" << gltf_json_escape(bone_names[i]) << "\"";
+
+            const auto bone = std::find_if(file_data.bone_name_map.begin(), file_data.bone_name_map.end(),
+                [&](const auto &item) { return item.second == bone_names[i]; });
+
+            std::vector<int> children;
+            if (bone != file_data.bone_name_map.end()) {
+                for (const auto &[child_index, child_name] : file_data.bone_name_map) {
+                    if (file_data.parent_index_map.at(child_index) == bone->first &&
+                        node_indices.find(child_name) != node_indices.end()) {
+                        children.push_back(node_indices[child_name]);
+                    }
+                }
+            }
+
+            if (!children.empty()) {
+                json << ",\"children\":[";
+                for (size_t j = 0; j < children.size(); ++j) {
+                    if (j != 0) json << ',';
+                    json << children[j];
+                }
+                json << ']';
+            }
+            json << '}';
+        }
+
+        json << "],\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," <<
+            gltf_base64(binary) << "\",\"byteLength\":" << binary.size() << "}],\"bufferViews\":[";
+
+        for (size_t i = 0; i < accessors.size(); ++i) {
+            if (i != 0) json << ',';
+            // 直接使用结构体中缓存的 component_count，安全且高效
+            json << "{\"buffer\":0,\"byteOffset\":" << accessors[i].offset <<
+                ",\"byteLength\":" << accessors[i].count * accessors[i].component_count * sizeof(float) << '}';
+        }
+
+        json << "],\"accessors\":[";
+        for (size_t i = 0; i < accessors.size(); ++i) {
+            if (i != 0) json << ',';
+            json << "{\"bufferView\":" << i << ",\"componentType\":5126,\"count\":" <<
+                accessors[i].count << ",\"type\":\"" << accessors[i].type << "\"}";
+        }
+
+        json << "],\"animations\":[{\"name\":\"" << gltf_json_escape(file_data.vmd->model_name) <<
+            "\",\"samplers\":[";
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (i != 0) json << ',';
+            json << "{\"input\":" << channels[i].input << ",\"output\":" <<
+                channels[i].output << ",\"interpolation\":\"LINEAR\"}";
+        }
+
+        json << "],\"channels\":[";
+        for (size_t i = 0; i < channels.size(); ++i) {
+            if (i != 0) json << ',';
+            json << "{\"sampler\":" << i << ",\"target\":{\"node\":" <<
+                channels[i].node << ",\"path\":\"" << channels[i].path << "\"}}";
+        }
+        json << "]}";
+
+        if (!file_data.vmd->face_frames.empty()) {
+            json << ",\"extras\":{\"morphAnimation\":[";
+            for (size_t i = 0; i < file_data.vmd->face_frames.size(); ++i) {
+                const auto &frame = file_data.vmd->face_frames[i];
+                if (i != 0) json << ',';
+                json << "{\"name\":\"" << gltf_json_escape(frame.face_name) <<
+                    "\",\"time\":" << std::max(0, static_cast<int>(frame.frame) - start_frame) /
+                    static_cast<float>(fps) << ",\"weight\":" << frame.weight << '}';
+            }
+            json << "]}";
+        }
+        json << '}';
+
+        // 使用 std::filesystem::path 直接构造 ofstream，彻底消除 MAX_PATH 限制和截断风险
+        std::ofstream output(final_path, std::ios::binary);
+        if (!output) {
+            archive.end();
+            return false;
+        }
+        output << json.str();
+    }
+
+    archive.end();
+    return true;
 }
 
 static void init_file_data(FileDataForVMD& data)
@@ -1241,6 +1560,7 @@ PYBIND11_MODULE(mmdbridge_vmd, m)
 		  py::arg("export_vertex_morph_animation_only"));
 	m.def("end_vmd_export", end_vmd_export);
 	m.def("execute_vmd_export", execute_vmd_export);
+	m.def("end_gltf_export", end_gltf_export);
 }
 
 #endif // WITH_VMD

@@ -37,6 +37,7 @@ export_vertex_morph_animation_only = False
 # --- General Settings ---
 # destination directory (eg. "C:/Users/user/Desktop/")
 dst_dir = "out"
+export_mode = 0
 
 
 # ================================================================================
@@ -119,7 +120,7 @@ if is_anything_to_export:
         os.makedirs(final_dst_dir, exist_ok=True)
 
         initial_file_snapshots = get_file_snapshots(out_dir)
-        end_vmd_export()
+        end_gltf_export() if export_mode else end_vmd_export()
         modified_file_snapshots = get_file_snapshots(out_dir) - initial_file_snapshots
         modified_files = {snapshot.path for snapshot in modified_file_snapshots}
         move_files(modified_files, final_dst_dir)
