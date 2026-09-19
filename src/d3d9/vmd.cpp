@@ -892,252 +892,7 @@ static bool execute_vmd_export(const int currentframe)
 				}
 			}
 
-			// Use helper function to calculate bone frame
-			vmd::VmdBoneFrame bone_frame = calculate_bone_frame(i, k, currentframe, file_data);
-
-			// -1: Only FK bones.
-			// 1: All FK bones. Exclude 付与親 and Bone Morph influences from bone animation. (For MMD / MMD Tools, which re-apply them at runtime)
-			if (std::abs(archive.export_fk_bone_animation_mode) == 1) {
-				// Remove grant parent influence
-				if (file_data.pmx && k < static_cast<int>(file_data.pmx->bones.size()))
-				{
-					const pmx::PmxBone& current_bone = file_data.pmx->bones[k];
-					const uint16_t grant_flags = current_bone.bone_flag & 0x0300; // 0x0100 | 0x0200
-
-					if (grant_flags && current_bone.grant_parent_index >= 0 &&
-						current_bone.grant_parent_index < static_cast<int>(file_data.pmx->bones.size()))
-					{
-						// Calculate grant parent bone frame
-						vmd::VmdBoneFrame grant_parent_frame = calculate_bone_frame(
-							i, current_bone.grant_parent_index, currentframe, file_data);
-
-						const float grant_weight = current_bone.grant_weight;
-
-						// Remove position grant influence
-						if (grant_flags & 0x0200) // Position grant
-						{
-							bone_frame.position[0] -= grant_parent_frame.position[0] * grant_weight;
-							bone_frame.position[1] -= grant_parent_frame.position[1] * grant_weight;
-							bone_frame.position[2] -= grant_parent_frame.position[2] * grant_weight;
-						}
-
-						// Remove rotation grant influence
-						if (grant_flags & 0x0100) // Rotation grant
-						{
-							// Create Imath quaternion objects
-							Imath::Quatf current_quat(bone_frame.orientation[3],
-													  bone_frame.orientation[0],
-													  bone_frame.orientation[1],
-													  bone_frame.orientation[2]);
-							Imath::Quatf parent_quat(grant_parent_frame.orientation[3],
-													 grant_parent_frame.orientation[0],
-													 grant_parent_frame.orientation[1],
-													 grant_parent_frame.orientation[2]);
-
-							// Create identity quaternion for interpolation
-							Imath::Quatf identity = Imath::Quatf::identity();
-
-							// Use slerp to calculate scaled parent quaternion
-							// scaled_parent_quat = slerp(identity, parent_quat, grant_weight)
-							Imath::Quatf scaled_parent_quat = slerpShortestArc(identity, parent_quat, grant_weight);
-
-							// Remove grant influence: current_pure = current * scaled_parent_quat^(-1)
-							Imath::Quatf pure_quat = current_quat * scaled_parent_quat.inverse();
-
-							// Normalize result
-							pure_quat.normalize();
-
-							// Convert back to VMD format (x, y, z, w)
-							bone_frame.orientation[0] = pure_quat.v.x;
-							bone_frame.orientation[1] = pure_quat.v.y;
-							bone_frame.orientation[2] = pure_quat.v.z;
-							bone_frame.orientation[3] = pure_quat.r;
-						}
-					}
-				}
-				else if (file_data.pmd && k < static_cast<int>(file_data.pmd->bones.size()))
-				{
-					const pmd::PmdBone& current_bone = file_data.pmd->bones[k];
-					int grant_parent_index = -1;
-					float grant_weight = 0.0f;
-					bool grant_rotation = false;
-					// pmd grant parent only supports rotation (RotationEffectable and RotationMovement)
-
-					if (current_bone.bone_type == pmd::BoneType::RotationEffectable) // Type 5
-					{
-						grant_parent_index = (current_bone.ik_parent_bone_index == 0xFFFF) ? -1 : current_bone.ik_parent_bone_index;
-						grant_weight = 1.0f;
-						grant_rotation = true;
-					}
-					else if (current_bone.bone_type == pmd::BoneType::RotationMovement) // Type 9
-					{
-						grant_parent_index = (current_bone.tail_pos_bone_index == 0xFFFF) ? -1 : current_bone.tail_pos_bone_index;
-						// For Type 9, the ik_parent_bone_index field stores the weight
-						grant_weight = static_cast<float>(current_bone.ik_parent_bone_index) / 100.0f;
-						grant_rotation = true;
-					}
-
-					if (grant_rotation && grant_parent_index >= 0 &&
-						grant_parent_index < static_cast<int>(file_data.pmd->bones.size()))
-					{
-						// Calculate grant parent bone frame
-						vmd::VmdBoneFrame grant_parent_frame = calculate_bone_frame(i, grant_parent_index, currentframe, file_data);
-
-						// Remove the influence of rotation grant
-						Imath::Quatf current_quat(bone_frame.orientation[3],
-												  bone_frame.orientation[0],
-												  bone_frame.orientation[1],
-												  bone_frame.orientation[2]);
-						Imath::Quatf parent_quat(grant_parent_frame.orientation[3],
-												 grant_parent_frame.orientation[0],
-												 grant_parent_frame.orientation[1],
-												 grant_parent_frame.orientation[2]);
-
-						Imath::Quatf identity = Imath::Quatf::identity();
-						Imath::Quatf scaled_parent_quat = slerpShortestArc(identity, parent_quat, grant_weight);
-						Imath::Quatf pure_quat = current_quat * scaled_parent_quat.inverse();
-						pure_quat.normalize();
-
-						bone_frame.orientation[0] = pure_quat.v.x;
-						bone_frame.orientation[1] = pure_quat.v.y;
-						bone_frame.orientation[2] = pure_quat.v.z;
-						bone_frame.orientation[3] = pure_quat.r;
-					}
-				}
-
-				// Remove bone morph influence (pmd doesn't have bone morph)
-				if (file_data.pmx)
-				{
-					Imath::Vec3 total_pos_offset(0.0f, 0.0f, 0.0f);
-					Imath::Quatf total_rot_offset = Imath::Quatf::identity();
-					const int morph_num = ExpGetPmdMorphNum(i);
-
-					for (int m = 0; m < morph_num; ++m)
-					{
-						const float morph_weight = ExpGetPmdMorphValue(i, m);
-						if (morph_weight == 0.0f)
-						{
-							continue;
-						}
-
-						// Validate morph name mapping (safety check)
-						const char* morph_name = ExpGetPmdMorphName(i, m);
-						auto it = file_data.morph_name_map.find(m);
-						if (it == file_data.morph_name_map.end() || it->second != morph_name)
-						{
-							continue;
-						}
-
-						const pmx::PmxMorph& morph = file_data.pmx->morphs[m];
-
-						// Case 1: Direct Bone Morph
-						if (morph.morph_type == pmx::MorphType::Bone)
-						{
-							for (const auto& bone_offset : morph.bone_offsets)
-							{
-								if (bone_offset.bone_index == k)
-								{
-									// Accumulate position offset
-									total_pos_offset.x += bone_offset.translation[0] * morph_weight;
-									total_pos_offset.y += bone_offset.translation[1] * morph_weight;
-									total_pos_offset.z += bone_offset.translation[2] * morph_weight;
-
-									// Accumulate rotation offset
-									Imath::Quatf offset_quat(bone_offset.rotation[3],  // w
-															 bone_offset.rotation[0],  // x
-															 bone_offset.rotation[1],  // y
-															 bone_offset.rotation[2]); // z
-									Imath::Quatf slerped_rot = slerpShortestArc(Imath::Quatf::identity(), offset_quat, morph_weight);
-									total_rot_offset = slerped_rot * total_rot_offset; // Apply in order
-								}
-							}
-						}
-						// Case 2: Group Morph (which might contain Bone Morphs)
-						else if (morph.morph_type == pmx::MorphType::Group)
-						{
-							for (const auto& group_offset : morph.group_offsets)
-							{
-								const float effective_weight = morph_weight * group_offset.morph_weight;
-								if (effective_weight == 0.0f ||
-									group_offset.morph_index < 0 ||
-									group_offset.morph_index >= file_data.pmx->morphs.size())
-								{
-									continue;
-								}
-
-								const pmx::PmxMorph& child_morph = file_data.pmx->morphs[group_offset.morph_index];
-								if (child_morph.morph_type == pmx::MorphType::Bone)
-								{
-									for (const auto& bone_offset : child_morph.bone_offsets)
-									{
-										if (bone_offset.bone_index == k)
-										{
-											// Accumulate position offset
-											total_pos_offset.x += bone_offset.translation[0] * effective_weight;
-											total_pos_offset.y += bone_offset.translation[1] * effective_weight;
-											total_pos_offset.z += bone_offset.translation[2] * effective_weight;
-
-											// Accumulate rotation offset
-											Imath::Quatf offset_quat(bone_offset.rotation[3],  // w
-																	 bone_offset.rotation[0],  // x
-																	 bone_offset.rotation[1],  // y
-																	 bone_offset.rotation[2]); // z
-											Imath::Quatf slerped_rot = slerpShortestArc(Imath::Quatf::identity(), offset_quat, effective_weight);
-											total_rot_offset = slerped_rot * total_rot_offset; // Apply in order
-										}
-									}
-								}
-							}
-						}
-					}
-
-					// If any morph affected this bone, apply the total inverse transform
-					if (total_pos_offset.length2() > 1e-6f || std::abs(total_rot_offset.r - 1.0f) > 1e-6f)
-					{
-						// Remove position influence
-						bone_frame.position[0] -= total_pos_offset.x;
-						bone_frame.position[1] -= total_pos_offset.y;
-						bone_frame.position[2] -= total_pos_offset.z;
-
-						// Remove rotation influence
-						Imath::Quatf current_quat(bone_frame.orientation[3],  // w
-												  bone_frame.orientation[0],  // x
-												  bone_frame.orientation[1],  // y
-												  bone_frame.orientation[2]); // z
-
-						Imath::Quatf pure_quat = current_quat * total_rot_offset.inverse();
-						pure_quat.normalize();
-
-						bone_frame.orientation[0] = pure_quat.v.x;
-						bone_frame.orientation[1] = pure_quat.v.y;
-						bone_frame.orientation[2] = pure_quat.v.z;
-						bone_frame.orientation[3] = pure_quat.r;
-					}
-				}
-			}
-			else // 2: All FK bones. Bake all influences (付与親, Bone Morph) into bone animation. (For other 3D software)
-			{
-				// Keep grant parent and bone morph influence
-				// The FK animation is already baked, do nothing
-			}
-
-			// Simplify animations
-			if (file_data.last_bone_frame.find(k) == file_data.last_bone_frame.end()) {
-				file_data.vmd->bone_frames.push_back(bone_frame);
-				file_data.last_bone_frame[k] = bone_frame;
-			} else {
-				vmd::VmdBoneFrame& last_frame = file_data.last_bone_frame[k];
-				if (std::pow(bone_frame.position[0] - last_frame.position[0], 2) +
-						std::pow(bone_frame.position[1] - last_frame.position[1], 2) +
-						std::pow(bone_frame.position[2] - last_frame.position[2], 2) > 1e-8f ||
-					std::abs(bone_frame.orientation[0] * last_frame.orientation[0] +
-							 bone_frame.orientation[1] * last_frame.orientation[1] +
-							 bone_frame.orientation[2] * last_frame.orientation[2] +
-							 bone_frame.orientation[3] * last_frame.orientation[3]) < 1 - 1e-5f) {
-								file_data.vmd->bone_frames.push_back(bone_frame);
-								file_data.last_bone_frame[k] = bone_frame;
-				}
-			}
+			export_bone_animation(i, k, currentframe, file_data);
 		}
 
 		// Handle IK frames for the first frame
@@ -1160,97 +915,318 @@ static bool execute_vmd_export(const int currentframe)
 		}
 
 		// morph (face)
-		if (archive.export_morph_animation)
-		{
-			const int morph_num = ExpGetPmdMorphNum(i);
-			if (archive.export_vertex_morph_animation_only && file_data.pmx)
-			{
-				// Bake all vertex morph weights, including contributions from group morphs.
-				// Key: vertex morph index, Value: accumulated weight
-				std::map<int, float> vertex_morph_weights;
-
-				for (int m = 0; m < morph_num; ++m)
-				{
-					// Validate morph name mapping
-					const char* morph_name = ExpGetPmdMorphName(i, m);
-					auto it = file_data.morph_name_map.find(m);
-					if (it == file_data.morph_name_map.end() || it->second != morph_name)
-					{
-						continue;
-					}
-
-					const pmx::PmxMorph& morph = file_data.pmx->morphs[m];
-					const float morph_weight = ExpGetPmdMorphValue(i, m);
-
-					if (morph.morph_type == pmx::MorphType::Vertex)
-					{
-						// Accumulate direct vertex morph contribution
-						vertex_morph_weights[m] += morph_weight;
-					}
-					else if (morph.morph_type == pmx::MorphType::Group)
-					{
-						// Expand group morph: accumulate each vertex morph child
-						for (const auto& group_offset : morph.group_offsets)
-						{
-							const int child_index = group_offset.morph_index;
-							if (child_index < 0 || child_index >= morph_num)
-							{
-								continue;
-							}
-
-							const pmx::PmxMorph& child_morph = file_data.pmx->morphs[child_index];
-							if (child_morph.morph_type != pmx::MorphType::Vertex)
-							{
-								continue;
-							}
-
-							// Validate child morph name mapping
-							const char* child_morph_name = ExpGetPmdMorphName(i, child_index);
-							auto child_it = file_data.morph_name_map.find(child_index);
-							if (child_it == file_data.morph_name_map.end() || child_it->second != child_morph_name)
-							{
-								continue;
-							}
-
-							const float effective_weight = morph_weight * group_offset.morph_weight;
-							vertex_morph_weights[child_index] += effective_weight;
-						}
-					}
-				}
-
-				// Emit one face frame per vertex morph with the accumulated weight
-				for (const auto& [morph_index, accumulated_weight] : vertex_morph_weights)
-				{
-					vmd::VmdFaceFrame face_frame;
-					face_frame.frame = static_cast<uint32_t>(currentframe);
-					face_frame.face_name = file_data.morph_name_map.at(morph_index);
-					face_frame.weight = accumulated_weight;
-					file_data.vmd->face_frames.push_back(face_frame);
-				}
-			}
-			else
-			{
-				// Default path: export all morphs as-is
-				for (int m = 0; m < morph_num; ++m)
-				{
-					const char* morph_name = ExpGetPmdMorphName(i, m);
-
-					// Validate morph name mapping
-					auto it = file_data.morph_name_map.find(m);
-					if (it == file_data.morph_name_map.end() || it->second != morph_name)
-					{
-						continue;
-					}
-
-					// Use helper function to calculate face frame
-					vmd::VmdFaceFrame face_frame = calculate_face_frame(i, m, currentframe, file_data);
-					file_data.vmd->face_frames.push_back(face_frame);
-				}
-			}
+		if (archive.export_morph_animation) {
+			export_morph_animation(i, currentframe, file_data);
 		}
 	}
 
 	return true;
+}
+
+static void export_bone_animation(int i, int k, int currentframe, FileDataForVMD &file_data) {
+	// Use helper function to calculate bone frame
+	vmd::VmdBoneFrame bone_frame = calculate_bone_frame(i, k, currentframe, file_data);
+
+	// -1: Only FK bones.
+	// 1: All FK bones. Exclude 付与親 and Bone Morph influences from bone animation. (For MMD / MMD Tools, which re-apply them at runtime)
+	if (std::abs(archive.export_fk_bone_animation_mode) == 1) {
+		// Remove grant parent influence
+		if (file_data.pmx && k < static_cast<int>(file_data.pmx->bones.size())) {
+			const pmx::PmxBone &current_bone = file_data.pmx->bones[k];
+			const uint16_t grant_flags = current_bone.bone_flag & 0x0300; // 0x0100 | 0x0200
+
+			if (grant_flags && current_bone.grant_parent_index >= 0 &&
+			    current_bone.grant_parent_index < static_cast<int>(file_data.pmx->bones.size())) {
+				// Calculate grant parent bone frame
+				vmd::VmdBoneFrame grant_parent_frame = calculate_bone_frame(
+					i, current_bone.grant_parent_index, currentframe, file_data);
+
+				const float grant_weight = current_bone.grant_weight;
+
+				// Remove position grant influence
+				if (grant_flags & 0x0200) // Position grant
+				{
+					bone_frame.position[0] -= grant_parent_frame.position[0] * grant_weight;
+					bone_frame.position[1] -= grant_parent_frame.position[1] * grant_weight;
+					bone_frame.position[2] -= grant_parent_frame.position[2] * grant_weight;
+				}
+
+				// Remove rotation grant influence
+				if (grant_flags & 0x0100) // Rotation grant
+				{
+					// Create Imath quaternion objects
+					Imath::Quatf current_quat(bone_frame.orientation[3],
+					                          bone_frame.orientation[0],
+					                          bone_frame.orientation[1],
+					                          bone_frame.orientation[2]);
+					Imath::Quatf parent_quat(grant_parent_frame.orientation[3],
+					                         grant_parent_frame.orientation[0],
+					                         grant_parent_frame.orientation[1],
+					                         grant_parent_frame.orientation[2]);
+
+					// Create identity quaternion for interpolation
+					Imath::Quatf identity = Imath::Quatf::identity();
+
+					// Use slerp to calculate scaled parent quaternion
+					// scaled_parent_quat = slerp(identity, parent_quat, grant_weight)
+					Imath::Quatf scaled_parent_quat = slerpShortestArc(identity, parent_quat, grant_weight);
+
+					// Remove grant influence: current_pure = current * scaled_parent_quat^(-1)
+					Imath::Quatf pure_quat = current_quat * scaled_parent_quat.inverse();
+
+					// Normalize result
+					pure_quat.normalize();
+
+					// Convert back to VMD format (x, y, z, w)
+					bone_frame.orientation[0] = pure_quat.v.x;
+					bone_frame.orientation[1] = pure_quat.v.y;
+					bone_frame.orientation[2] = pure_quat.v.z;
+					bone_frame.orientation[3] = pure_quat.r;
+				}
+			}
+		} else if (file_data.pmd && k < static_cast<int>(file_data.pmd->bones.size())) {
+			const pmd::PmdBone &current_bone = file_data.pmd->bones[k];
+			int grant_parent_index = -1;
+			float grant_weight = 0.0f;
+			bool grant_rotation = false;
+			// pmd grant parent only supports rotation (RotationEffectable and RotationMovement)
+
+			if (current_bone.bone_type == pmd::BoneType::RotationEffectable) // Type 5
+			{
+				grant_parent_index =
+					(current_bone.ik_parent_bone_index == 0xFFFF) ? -1 : current_bone.ik_parent_bone_index;
+				grant_weight = 1.0f;
+				grant_rotation = true;
+			} else if (current_bone.bone_type == pmd::BoneType::RotationMovement) // Type 9
+			{
+				grant_parent_index =
+					(current_bone.tail_pos_bone_index == 0xFFFF) ? -1 : current_bone.tail_pos_bone_index;
+				// For Type 9, the ik_parent_bone_index field stores the weight
+				grant_weight = static_cast<float>(current_bone.ik_parent_bone_index) / 100.0f;
+				grant_rotation = true;
+			}
+
+			if (grant_rotation && grant_parent_index >= 0 &&
+			    grant_parent_index < static_cast<int>(file_data.pmd->bones.size())) {
+				// Calculate grant parent bone frame
+				vmd::VmdBoneFrame grant_parent_frame = calculate_bone_frame(
+					i, grant_parent_index, currentframe, file_data);
+
+				// Remove the influence of rotation grant
+				Imath::Quatf current_quat(bone_frame.orientation[3],
+				                          bone_frame.orientation[0],
+				                          bone_frame.orientation[1],
+				                          bone_frame.orientation[2]);
+				Imath::Quatf parent_quat(grant_parent_frame.orientation[3],
+				                         grant_parent_frame.orientation[0],
+				                         grant_parent_frame.orientation[1],
+				                         grant_parent_frame.orientation[2]);
+
+				Imath::Quatf identity = Imath::Quatf::identity();
+				Imath::Quatf scaled_parent_quat = slerpShortestArc(identity, parent_quat, grant_weight);
+				Imath::Quatf pure_quat = current_quat * scaled_parent_quat.inverse();
+				pure_quat.normalize();
+
+				bone_frame.orientation[0] = pure_quat.v.x;
+				bone_frame.orientation[1] = pure_quat.v.y;
+				bone_frame.orientation[2] = pure_quat.v.z;
+				bone_frame.orientation[3] = pure_quat.r;
+			}
+		}
+
+		// Remove bone morph influence (pmd doesn't have bone morph)
+		if (file_data.pmx) {
+			Imath::Vec3 total_pos_offset(0.0f, 0.0f, 0.0f);
+			Imath::Quatf total_rot_offset = Imath::Quatf::identity();
+			const int morph_num = ExpGetPmdMorphNum(i);
+
+			for (int m = 0; m < morph_num; ++m) {
+				const float morph_weight = ExpGetPmdMorphValue(i, m);
+				if (morph_weight == 0.0f) {
+					continue;
+				}
+
+				// Validate morph name mapping (safety check)
+				const char *morph_name = ExpGetPmdMorphName(i, m);
+				auto it = file_data.morph_name_map.find(m);
+				if (it == file_data.morph_name_map.end() || it->second != morph_name) {
+					continue;
+				}
+
+				const pmx::PmxMorph &morph = file_data.pmx->morphs[m];
+
+				// Case 1: Direct Bone Morph
+				if (morph.morph_type == pmx::MorphType::Bone) {
+					for (const auto &bone_offset: morph.bone_offsets) {
+						if (bone_offset.bone_index == k) {
+							// Accumulate position offset
+							total_pos_offset.x += bone_offset.translation[0] * morph_weight;
+							total_pos_offset.y += bone_offset.translation[1] * morph_weight;
+							total_pos_offset.z += bone_offset.translation[2] * morph_weight;
+
+							// Accumulate rotation offset
+							Imath::Quatf offset_quat(bone_offset.rotation[3], // w
+							                         bone_offset.rotation[0], // x
+							                         bone_offset.rotation[1], // y
+							                         bone_offset.rotation[2]); // z
+							Imath::Quatf slerped_rot = slerpShortestArc(
+								Imath::Quatf::identity(), offset_quat, morph_weight);
+							total_rot_offset = slerped_rot * total_rot_offset; // Apply in order
+						}
+					}
+				}
+				// Case 2: Group Morph (which might contain Bone Morphs)
+				else if (morph.morph_type == pmx::MorphType::Group) {
+					for (const auto &group_offset: morph.group_offsets) {
+						const float effective_weight = morph_weight * group_offset.morph_weight;
+						if (effective_weight == 0.0f ||
+						    group_offset.morph_index < 0 ||
+						    group_offset.morph_index >= file_data.pmx->morphs.size()) {
+							continue;
+						}
+
+						const pmx::PmxMorph &child_morph = file_data.pmx->morphs[group_offset.morph_index];
+						if (child_morph.morph_type == pmx::MorphType::Bone) {
+							for (const auto &bone_offset: child_morph.bone_offsets) {
+								if (bone_offset.bone_index == k) {
+									// Accumulate position offset
+									total_pos_offset.x += bone_offset.translation[0] * effective_weight;
+									total_pos_offset.y += bone_offset.translation[1] * effective_weight;
+									total_pos_offset.z += bone_offset.translation[2] * effective_weight;
+
+									// Accumulate rotation offset
+									Imath::Quatf offset_quat(bone_offset.rotation[3], // w
+									                         bone_offset.rotation[0], // x
+									                         bone_offset.rotation[1], // y
+									                         bone_offset.rotation[2]); // z
+									Imath::Quatf slerped_rot = slerpShortestArc(
+										Imath::Quatf::identity(), offset_quat, effective_weight);
+									total_rot_offset = slerped_rot * total_rot_offset; // Apply in order
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// If any morph affected this bone, apply the total inverse transform
+			if (total_pos_offset.length2() > 1e-6f || std::abs(total_rot_offset.r - 1.0f) > 1e-6f) {
+				// Remove position influence
+				bone_frame.position[0] -= total_pos_offset.x;
+				bone_frame.position[1] -= total_pos_offset.y;
+				bone_frame.position[2] -= total_pos_offset.z;
+
+				// Remove rotation influence
+				Imath::Quatf current_quat(bone_frame.orientation[3], // w
+				                          bone_frame.orientation[0], // x
+				                          bone_frame.orientation[1], // y
+				                          bone_frame.orientation[2]); // z
+
+				Imath::Quatf pure_quat = current_quat * total_rot_offset.inverse();
+				pure_quat.normalize();
+
+				bone_frame.orientation[0] = pure_quat.v.x;
+				bone_frame.orientation[1] = pure_quat.v.y;
+				bone_frame.orientation[2] = pure_quat.v.z;
+				bone_frame.orientation[3] = pure_quat.r;
+			}
+		}
+	} else // 2: All FK bones. Bake all influences (付与親, Bone Morph) into bone animation. (For other 3D software)
+	{
+		// Keep grant parent and bone morph influence
+		// The FK animation is already baked, do nothing
+	}
+
+	// Simplify animations
+	if (file_data.last_bone_frame.find(k) == file_data.last_bone_frame.end()) {
+		file_data.vmd->bone_frames.push_back(bone_frame);
+		file_data.last_bone_frame[k] = bone_frame;
+	} else {
+		vmd::VmdBoneFrame &last_frame = file_data.last_bone_frame[k];
+		if (std::pow(bone_frame.position[0] - last_frame.position[0], 2) +
+		    std::pow(bone_frame.position[1] - last_frame.position[1], 2) +
+		    std::pow(bone_frame.position[2] - last_frame.position[2], 2) > 1e-8f ||
+		    std::abs(bone_frame.orientation[0] * last_frame.orientation[0] +
+		             bone_frame.orientation[1] * last_frame.orientation[1] +
+		             bone_frame.orientation[2] * last_frame.orientation[2] +
+		             bone_frame.orientation[3] * last_frame.orientation[3]) < 1 - 1e-5f) {
+			file_data.vmd->bone_frames.push_back(bone_frame);
+			file_data.last_bone_frame[k] = bone_frame;
+		}
+	}
+}
+
+static void export_morph_animation(int i, int currentframe, FileDataForVMD &file_data) {
+	const int morph_num = ExpGetPmdMorphNum(i);
+	if (archive.export_vertex_morph_animation_only && file_data.pmx) {
+		// Bake all vertex morph weights, including contributions from group morphs.
+		// Key: vertex morph index, Value: accumulated weight
+		std::map<int, float> vertex_morph_weights;
+
+		for (int m = 0; m < morph_num; ++m) {
+			// Validate morph name mapping
+			const char *morph_name = ExpGetPmdMorphName(i, m);
+			auto it = file_data.morph_name_map.find(m);
+			if (it == file_data.morph_name_map.end() || it->second != morph_name) {
+				continue;
+			}
+
+			const pmx::PmxMorph &morph = file_data.pmx->morphs[m];
+			const float morph_weight = ExpGetPmdMorphValue(i, m);
+
+			if (morph.morph_type == pmx::MorphType::Vertex) {
+				// Accumulate direct vertex morph contribution
+				vertex_morph_weights[m] += morph_weight;
+			} else if (morph.morph_type == pmx::MorphType::Group) {
+				// Expand group morph: accumulate each vertex morph child
+				for (const auto &group_offset: morph.group_offsets) {
+					const int child_index = group_offset.morph_index;
+					if (child_index < 0 || child_index >= morph_num) {
+						continue;
+					}
+
+					const pmx::PmxMorph &child_morph = file_data.pmx->morphs[child_index];
+					if (child_morph.morph_type != pmx::MorphType::Vertex) {
+						continue;
+					}
+
+					// Validate child morph name mapping
+					const char *child_morph_name = ExpGetPmdMorphName(i, child_index);
+					auto child_it = file_data.morph_name_map.find(child_index);
+					if (child_it == file_data.morph_name_map.end() || child_it->second != child_morph_name) {
+						continue;
+					}
+
+					const float effective_weight = morph_weight * group_offset.morph_weight;
+					vertex_morph_weights[child_index] += effective_weight;
+				}
+			}
+		}
+
+		// Emit one face frame per vertex morph with the accumulated weight
+		for (const auto &[morph_index, accumulated_weight]: vertex_morph_weights) {
+			vmd::VmdFaceFrame face_frame;
+			face_frame.frame = static_cast<uint32_t>(currentframe);
+			face_frame.face_name = file_data.morph_name_map.at(morph_index);
+			face_frame.weight = accumulated_weight;
+			file_data.vmd->face_frames.push_back(face_frame);
+		}
+	} else {
+		// Default path: export all morphs as-is
+		for (int m = 0; m < morph_num; ++m) {
+			const char *morph_name = ExpGetPmdMorphName(i, m);
+
+			// Validate morph name mapping
+			auto it = file_data.morph_name_map.find(m);
+			if (it == file_data.morph_name_map.end() || it->second != morph_name) {
+				continue;
+			}
+
+			// Use helper function to calculate face frame
+			vmd::VmdFaceFrame face_frame = calculate_face_frame(i, m, currentframe, file_data);
+			file_data.vmd->face_frames.push_back(face_frame);
+		}
+	}
 }
 
 // ---------------------------------------------------------------------------
