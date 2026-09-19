@@ -556,7 +556,6 @@ static bool end_gltf_export() {
 		file_data.vmd->bone_frames = PostProcessKeyframes(
 			file_data.vmd->bone_frames, get_bone_name, are_bones_equal, is_bone_zero);
 
-		// 创建骨骼索引到 glTF 节点索引的映射
 		std::map<int, int> bone_to_gltf_node;
 		int gltf_node_idx = 0;
 		for (const auto& pair : file_data.bone_name_map) {
@@ -580,60 +579,60 @@ static bool end_gltf_export() {
 			});
 		}
 
-		// 【修复】使用正确的数据结构
-		std::vector<unsigned char> binary;
+		// 使用 std::string 存储二进制数据，方便传给 gltf_base64
+		std::string binary;
 		struct Accessor {
 			size_t offset;
 			size_t count;
 			const char* type;
-			const char* componentType; // "5120" (BYTE), "5121" (UNSIGNED_BYTE), "5122" (SHORT),
-			                           // "5123" (UNSIGNED_SHORT), "5126" (FLOAT)
+			const char* componentType;
 			size_t component_count;
-			float minVal;
-			float maxVal;
+			std::vector<float> minVals;
+			std::vector<float> maxVals;
 		};
 		std::vector<Accessor> accessors;
 
 		auto add_accessor_float = [&](const std::vector<float>& values, const char* type,
 		                               const char* compType, size_t components) {
 			while ((binary.size() & 3) != 0) {
-				binary.push_back(0);
+				binary.push_back('\0');
 			}
 			const size_t offset = binary.size();
 
-			float minVal = values.empty() ? 0.0f : values[0];
-			float maxVal = values.empty() ? 0.0f : values[0];
-			for (float v : values) {
-				if (v < minVal) minVal = v;
-				if (v > maxVal) maxVal = v;
-				unsigned char* bytes = reinterpret_cast<unsigned char*>(&v);
-				for (size_t b = 0; b < sizeof(float); ++b) {
-					binary.push_back(bytes[b]);
-				}
+			std::vector<float> minVals(components, values.empty() ? 0.0f : values[0]);
+			std::vector<float> maxVals(components, values.empty() ? 0.0f : values[0]);
+
+			for (size_t i = 0; i < values.size(); ++i) {
+				size_t comp_idx = i % components;
+				if (values[i] < minVals[comp_idx]) minVals[comp_idx] = values[i];
+				if (values[i] > maxVals[comp_idx]) maxVals[comp_idx] = values[i];
 			}
 
-			accessors.push_back({ offset, values.size() / components, type, compType, components, minVal, maxVal });
+			binary.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));
+
+			accessors.push_back({ offset, values.size() / components, type, compType, components, minVals, maxVals });
 			return static_cast<int>(accessors.size() - 1);
 		};
 
-		auto add_accessor_ushort = [&](const std::vector<unsigned short>& values, const char* type) {
+		auto add_accessor_ushort = [&](const std::vector<unsigned short>& values, const char* type, size_t components) {
 			while ((binary.size() & 1) != 0) {
-				binary.push_back(0);
+				binary.push_back('\0');
 			}
 			const size_t offset = binary.size();
 
-			float minVal = values.empty() ? 0.0f : static_cast<float>(values[0]);
-			float maxVal = values.empty() ? 0.0f : static_cast<float>(values[0]);
-			for (unsigned short v : values) {
-				if (static_cast<float>(v) < minVal) minVal = static_cast<float>(v);
-				if (static_cast<float>(v) > maxVal) maxVal = static_cast<float>(v);
-				unsigned char* bytes = reinterpret_cast<unsigned char*>(&v);
-				for (size_t b = 0; b < sizeof(unsigned short); ++b) {
-					binary.push_back(bytes[b]);
-				}
+			std::vector<float> minVals(components, values.empty() ? 0.0f : static_cast<float>(values[0]));
+			std::vector<float> maxVals(components, values.empty() ? 0.0f : static_cast<float>(values[0]));
+
+			for (size_t i = 0; i < values.size(); ++i) {
+				size_t comp_idx = i % components;
+				float val = static_cast<float>(values[i]);
+				if (val < minVals[comp_idx]) minVals[comp_idx] = val;
+				if (val > maxVals[comp_idx]) maxVals[comp_idx] = val;
 			}
 
-			accessors.push_back({ offset, values.size(), type, "5123", 1, minVal, maxVal });
+			binary.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(unsigned short));
+
+			accessors.push_back({ offset, values.size() / components, type, "5123", components, minVals, maxVals });
 			return static_cast<int>(accessors.size() - 1);
 		};
 
@@ -661,7 +660,6 @@ static bool end_gltf_export() {
 				convert_coordinate_mmd_to_gltf(pos);
 				translations.insert(translations.end(), pos, pos + 3);
 
-				// 四元数转换（MMD 是左手系，glTF 是右手系）
 				float rot[4] = {
 					frame->orientation[0],
 					frame->orientation[2],
@@ -706,21 +704,16 @@ static bool end_gltf_export() {
 
 		size_t bone_count = file_data.bone_name_map.size();
 
-		// 【修复】创建简单的 mesh - 单个顶点
 		std::vector<float> mesh_positions = {0.0f, 0.0f, 0.0f};
 		std::vector<float> mesh_normals = {0.0f, 1.0f, 0.0f};
-
-		// 【修复】权重必须是 VEC4，使用 UNSIGNED_SHORT
-		// 只给前4个骨骼分配权重，其余为0
 		std::vector<unsigned short> mesh_joints = {0, 1, 2, 3};
 		std::vector<float> mesh_weights = {0.25f, 0.25f, 0.25f, 0.25f};
 
 		int mesh_pos_accessor = add_accessor_float(mesh_positions, "VEC3", "5126", 3);
 		int mesh_norm_accessor = add_accessor_float(mesh_normals, "VEC3", "5126", 3);
-		int mesh_joints_accessor = add_accessor_ushort(mesh_joints, "VEC4");
+		int mesh_joints_accessor = add_accessor_ushort(mesh_joints, "VEC4", 4);
 		int mesh_weights_accessor = add_accessor_float(mesh_weights, "VEC4", "5126", 4);
 
-		// Inverse bind matrices
 		std::vector<float> ibm_data;
 		for (size_t bone_idx = 0; bone_idx < bone_count; ++bone_idx) {
 			ibm_data.insert(ibm_data.end(), {
@@ -732,7 +725,6 @@ static bool end_gltf_export() {
 		}
 		int ibm_accessor = add_accessor_float(ibm_data, "MAT4", "5126", 16);
 
-		// 计算骨骼位置
 		std::map<int, float[3]> bone_positions;
 		auto get_bone_position = [&](int bone_index, float position[3]) {
 			if (file_data.pmd) {
@@ -755,7 +747,6 @@ static bool end_gltf_export() {
 			get_bone_position(bone_index, bone_positions[bone_index]);
 		}
 
-		// 【修复】找到根骨骼
 		int root_bone_index = -1;
 		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
 			if (file_data.parent_index_map.at(bone_index) < 0) {
@@ -768,10 +759,9 @@ static bool end_gltf_export() {
 		json << std::setprecision(9);
 		json << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"mmdbridge\"},\"scene\":0,\"scenes\":[{\"nodes\":[";
 
-		json << bone_count; // mesh 节点
+		json << bone_count;
 		json << "]}],\"nodes\":[";
 
-		// 骨骼节点
 		bool first_node = true;
 		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
 			if (!first_node) json << ',';
@@ -808,19 +798,16 @@ static bool end_gltf_export() {
 			json << '}';
 		}
 
-		// Mesh 节点 - 【修复】parent 设为根骨骼，确保有共同根
 		json << ",{\"name\":\"Mesh\",\"mesh\":0,\"skin\":0";
 		if (root_bone_index >= 0) {
-			json << ",\"translation\":[0,0,0],\"parent\":" << bone_to_gltf_node[root_bone_index];
+			json << ",\"translation\":[0,0,0]";
 		}
 		json << "}]";
 
-		// Meshes
 		json << ",\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":" << mesh_pos_accessor <<
 			",\"NORMAL\":" << mesh_norm_accessor << ",\"JOINTS_0\":" << mesh_joints_accessor <<
 			",\"WEIGHTS_0\":" << mesh_weights_accessor << "},\"mode\":0}]}]";
 
-		// Skins
 		json << ",\"skins\":[{\"inverseBindMatrices\":" << ibm_accessor << ",\"joints\":[";
 		bool first_joint = true;
 		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
@@ -835,32 +822,37 @@ static bool end_gltf_export() {
 		}
 		json << "}]";
 
-		// Buffers
 		json << ",\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," <<
-			gltf_base64(reinterpret_cast<const char*>(binary.data()), binary.size()) <<
-			"\",\"byteLength\":" << binary.size() << "}],\"bufferViews\":[";
+			gltf_base64(binary) << "\",\"byteLength\":" << binary.size() << "}],\"bufferViews\":[";
 
 		for (size_t index = 0; index < accessors.size(); ++index) {
 			if (index != 0) json << ',';
 			size_t byte_stride = 0;
-			if (accessors[index].componentType == "5126") byte_stride = 4; // FLOAT
-			else if (accessors[index].componentType == "5123") byte_stride = 2; // UNSIGNED_SHORT
-			else if (accessors[index].componentType == "5121") byte_stride = 1; // UNSIGNED_BYTE
+			if (strcmp(accessors[index].componentType, "5126") == 0) byte_stride = 4;
+			else if (strcmp(accessors[index].componentType, "5123") == 0) byte_stride = 2;
+			else if (strcmp(accessors[index].componentType, "5121") == 0) byte_stride = 1;
 
 			json << "{\"buffer\":0,\"byteOffset\":" << accessors[index].offset <<
 				",\"byteLength\":" << accessors[index].count * accessors[index].component_count * byte_stride << '}';
 		}
 
-		// Accessors
 		json << "],\"accessors\":[";
 		for (size_t index = 0; index < accessors.size(); ++index) {
 			if (index != 0) json << ',';
 			json << "{\"bufferView\":" << index << ",\"componentType\":" << accessors[index].componentType <<
-				",\"count\":" << accessors[index].count << ",\"type\":\"" << accessors[index].type <<
-				"\",\"min\":[" << accessors[index].minVal << "],\"max\":[" << accessors[index].maxVal << "]}";
+				",\"count\":" << accessors[index].count << ",\"type\":\"" << accessors[index].type << "\",\"min\":[";
+			for (size_t j = 0; j < accessors[index].minVals.size(); ++j) {
+				if (j > 0) json << ',';
+				json << accessors[index].minVals[j];
+			}
+			json << "],\"max\":[";
+			for (size_t j = 0; j < accessors[index].maxVals.size(); ++j) {
+				if (j > 0) json << ',';
+				json << accessors[index].maxVals[j];
+			}
+			json << "]}";
 		}
 
-		// Animations
 		json << "],\"animations\":[{\"name\":\"" << gltf_escape(file_data.vmd->model_name) <<
 			"\",\"samplers\":[";
 		for (size_t index = 0; index < channels.size(); ++index) {
