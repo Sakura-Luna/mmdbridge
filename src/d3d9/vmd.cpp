@@ -1111,144 +1111,13 @@ static vmd::VmdFaceFrame calculate_face_frame(
 	return face_frame;
 }
 
-static bool execute_vmd_export(const int currentframe)
-{
-	VMDArchive& archive = VMDArchive::instance();
-
-	if (!archive.is_start_vmd_export_called)
-	{
-		if (!archive.is_start_vmd_export_warning_shown)
-		{
-			archive.is_start_vmd_export_warning_shown = true;
-			ShowFrameRangeConfigError();
-		}
-		return false;
-	}
-
-	const BridgeParameter& parameter = BridgeParameter::instance();
-	const int pmd_num = ExpGetPmdNum();
-
-	if (currentframe == parameter.start_frame)
-	{
-		for (int i = 0; i < pmd_num; ++i)
-		{
-			FileDataForVMD& file_data = archive.data_list.at(i);
-			init_file_data(file_data);
-
-			file_data.vmd = std::make_unique<vmd::VmdMotion>();
-			if (file_data.pmd)
-			{
-				file_data.vmd->model_name = file_data.pmd->header.name;
-			}
-			else if (file_data.pmx)
-			{
-				oguna::EncodingConverter::Utf16ToCp932(file_data.pmx->model_name.c_str(), static_cast<int>(file_data.pmx->model_name.length()), &file_data.vmd->model_name);
-			}
-		}
-	}
-
-	for (int i = 0; i < pmd_num; ++i)
-	{
-		FileDataForVMD& file_data = archive.data_list.at(i);
-		const int bone_num = ExpGetPmdBoneNum(i);
-		for (int k = 0; k < bone_num; ++k)
-		{
-			const char* bone_name = ExpGetPmdBoneName(i, k);
-
-			if (!archive.has_bone_name_error && (bone_name == nullptr || strlen(bone_name) == 0))
-			{
-				archive.has_bone_name_error = true;
-				ShowInvalidBoneNameError();
-			}
-
-			// Validate bone name mapping
-			{
-				auto it = file_data.bone_name_map.find(k);
-				if (it == file_data.bone_name_map.end() || it->second != bone_name)
-				{
-					continue;
-				}
-			}
-
-			// Export mode filtering
-			const bool is_ik_effector_bone = file_data.ik_frame_bone_map.count(k) > 0;
-			// const bool is_affected_by_ik = file_data.ik_bone_map.count(k) > 0;
-			// const bool is_fuyo_effector_bone = file_data.fuyo_target_map.find(k) != file_data.fuyo_target_map.end();
-			// const bool is_affected_by_fuyo = file_data.fuyo_bone_map.count(k) > 0;
-			bool is_physics_bone = false;
-			bool is_simulated_physics_bone = false;
-			bool is_non_simulated_physics_bone = false;
-			{
-				auto it = file_data.physics_bone_map.find(k);
-				is_physics_bone = (it != file_data.physics_bone_map.end());
-				if (is_physics_bone)
-				{
-					if (it->second == 0) // ボーン追従
-					{
-						is_non_simulated_physics_bone = true;
-					}
-					else
-					{
-						is_simulated_physics_bone = true;
-					}
-				}
-			}
-
-			// Since IK is baked to FK, skip exporting IK bone motion keyframes
-			if (is_ik_effector_bone)
-			{
-				if (!archive.export_ik_bone_animation)
-				{
-					continue;
-				}
-			} else { // This is an FK bone
-				if (is_simulated_physics_bone) {
-					if (archive.export_fk_bone_animation_mode < 0) {
-						continue;
-					}
-				} else if (archive.export_fk_bone_animation_mode == 0) { // 0: Simulated physics bones only
-					continue;
-				}
-			}
-
-			export_bone_animation(i, k, currentframe, file_data);
-		}
-
-		// Handle IK frames for the first frame
-		if (archive.add_turn_off_ik_keyframe && currentframe == parameter.start_frame)
-		{
-			vmd::VmdIkFrame ik_frame;
-			ik_frame.frame = currentframe;
-			ik_frame.display = true;
-			for (auto it = file_data.ik_frame_bone_map.begin(); it != file_data.ik_frame_bone_map.end(); ++it)
-			{
-				if (file_data.bone_name_map.find(it->first) != file_data.bone_name_map.end())
-				{
-					vmd::VmdIkEnable ik_enable;
-					ik_enable.ik_name = file_data.bone_name_map[it->first];
-					ik_enable.enable = false;
-					ik_frame.ik_enable.push_back(ik_enable);
-				}
-			}
-			file_data.vmd->ik_frames.push_back(ik_frame);
-		}
-
-		// morph (face)
-		if (archive.export_morph_animation) {
-			export_morph_animation(i, currentframe, file_data);
-		}
-	}
-
-	return true;
-}
-
-static void export_bone_animation(int i, int k, int currentframe, FileDataForVMD &file_data) {
+static void export_bone_animation(int i, int k, int currentframe, FileDataForVMD &file_data, int mode){
 	// Use helper function to calculate bone frame
 	vmd::VmdBoneFrame bone_frame = calculate_bone_frame(i, k, currentframe, file_data);
 
 	// -1: Only FK bones.
 	// 1: All FK bones. Exclude 付与親 and Bone Morph influences from bone animation. (For MMD / MMD Tools, which re-apply them at runtime)
-	if (std::abs(archive.export_fk_bone_animation_mode) == 1) {
+	if (std::abs(mode) == 1) {
 		// Remove grant parent influence
 		if (file_data.pmx && k < static_cast<int>(file_data.pmx->bones.size())) {
 			const pmx::PmxBone &current_bone = file_data.pmx->bones[k];
@@ -1475,9 +1344,9 @@ static void export_bone_animation(int i, int k, int currentframe, FileDataForVMD
 	}
 }
 
-static void export_morph_animation(int i, int currentframe, FileDataForVMD &file_data) {
+static void export_morph_animation(int i, int currentframe, FileDataForVMD &file_data, bool mode) {
 	const int morph_num = ExpGetPmdMorphNum(i);
-	if (archive.export_vertex_morph_animation_only && file_data.pmx) {
+	if (mode && file_data.pmx) {
 		// Bake all vertex morph weights, including contributions from group morphs.
 		// Key: vertex morph index, Value: accumulated weight
 		std::map<int, float> vertex_morph_weights;
@@ -1546,6 +1415,137 @@ static void export_morph_animation(int i, int currentframe, FileDataForVMD &file
 			file_data.vmd->face_frames.push_back(face_frame);
 		}
 	}
+}
+
+static bool execute_vmd_export(const int currentframe)
+{
+	VMDArchive& archive = VMDArchive::instance();
+
+	if (!archive.is_start_vmd_export_called)
+	{
+		if (!archive.is_start_vmd_export_warning_shown)
+		{
+			archive.is_start_vmd_export_warning_shown = true;
+			ShowFrameRangeConfigError();
+		}
+		return false;
+	}
+
+	const BridgeParameter& parameter = BridgeParameter::instance();
+	const int pmd_num = ExpGetPmdNum();
+
+	if (currentframe == parameter.start_frame)
+	{
+		for (int i = 0; i < pmd_num; ++i)
+		{
+			FileDataForVMD& file_data = archive.data_list.at(i);
+			init_file_data(file_data);
+
+			file_data.vmd = std::make_unique<vmd::VmdMotion>();
+			if (file_data.pmd)
+			{
+				file_data.vmd->model_name = file_data.pmd->header.name;
+			}
+			else if (file_data.pmx)
+			{
+				oguna::EncodingConverter::Utf16ToCp932(file_data.pmx->model_name.c_str(), static_cast<int>(file_data.pmx->model_name.length()), &file_data.vmd->model_name);
+			}
+		}
+	}
+
+	for (int i = 0; i < pmd_num; ++i)
+	{
+		FileDataForVMD& file_data = archive.data_list.at(i);
+		const int bone_num = ExpGetPmdBoneNum(i);
+		for (int k = 0; k < bone_num; ++k)
+		{
+			const char* bone_name = ExpGetPmdBoneName(i, k);
+
+			if (!archive.has_bone_name_error && (bone_name == nullptr || strlen(bone_name) == 0))
+			{
+				archive.has_bone_name_error = true;
+				ShowInvalidBoneNameError();
+			}
+
+			// Validate bone name mapping
+			{
+				auto it = file_data.bone_name_map.find(k);
+				if (it == file_data.bone_name_map.end() || it->second != bone_name)
+				{
+					continue;
+				}
+			}
+
+			// Export mode filtering
+			const bool is_ik_effector_bone = file_data.ik_frame_bone_map.count(k) > 0;
+			// const bool is_affected_by_ik = file_data.ik_bone_map.count(k) > 0;
+			// const bool is_fuyo_effector_bone = file_data.fuyo_target_map.find(k) != file_data.fuyo_target_map.end();
+			// const bool is_affected_by_fuyo = file_data.fuyo_bone_map.count(k) > 0;
+			bool is_physics_bone = false;
+			bool is_simulated_physics_bone = false;
+			bool is_non_simulated_physics_bone = false;
+			{
+				auto it = file_data.physics_bone_map.find(k);
+				is_physics_bone = (it != file_data.physics_bone_map.end());
+				if (is_physics_bone)
+				{
+					if (it->second == 0) // ボーン追従
+					{
+						is_non_simulated_physics_bone = true;
+					}
+					else
+					{
+						is_simulated_physics_bone = true;
+					}
+				}
+			}
+
+			// Since IK is baked to FK, skip exporting IK bone motion keyframes
+			if (is_ik_effector_bone)
+			{
+				if (!archive.export_ik_bone_animation)
+				{
+					continue;
+				}
+			} else { // This is an FK bone
+				if (is_simulated_physics_bone) {
+					if (archive.export_fk_bone_animation_mode < 0) {
+						continue;
+					}
+				} else if (archive.export_fk_bone_animation_mode == 0) { // 0: Simulated physics bones only
+					continue;
+				}
+			}
+
+			export_bone_animation(i, k, currentframe, file_data, archive.export_fk_bone_animation_mode);
+		}
+
+		// Handle IK frames for the first frame
+		if (archive.add_turn_off_ik_keyframe && currentframe == parameter.start_frame)
+		{
+			vmd::VmdIkFrame ik_frame;
+			ik_frame.frame = currentframe;
+			ik_frame.display = true;
+			for (auto it = file_data.ik_frame_bone_map.begin(); it != file_data.ik_frame_bone_map.end(); ++it)
+			{
+				if (file_data.bone_name_map.find(it->first) != file_data.bone_name_map.end())
+				{
+					vmd::VmdIkEnable ik_enable;
+					ik_enable.ik_name = file_data.bone_name_map[it->first];
+					ik_enable.enable = false;
+					ik_frame.ik_enable.push_back(ik_enable);
+				}
+			}
+			file_data.vmd->ik_frames.push_back(ik_frame);
+		}
+
+		// morph (face)
+		if (archive.export_morph_animation) {
+			export_morph_animation(i, currentframe, file_data, archive.export_vertex_morph_animation_only);
+		}
+	}
+
+	return true;
 }
 
 // ---------------------------------------------------------------------------
