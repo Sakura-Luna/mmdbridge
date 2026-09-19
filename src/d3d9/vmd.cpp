@@ -467,11 +467,10 @@ static std::string gltf_escape(const std::string& value)
 			case '\n': stream << "\\n"; break;
 			case '\r': stream << "\\r"; break;
 			case '\t': stream << "\\t"; break;
-			case '\b': stream << "\\b"; break; // 新增：退格符
-			case '\f': stream << "\\f"; break; // 新增：换页符
+			case '\b': stream << "\\b"; break;
+			case '\f': stream << "\\f"; break;
 			default:
 				if (c < 0x20) {
-					// 安全转义其他控制字符，防止生成非法 JSON
 					char buf[8];
 					snprintf(buf, sizeof(buf), "\\u%04x", static_cast<int>(c));
 					stream << buf;
@@ -488,7 +487,7 @@ static std::string gltf_base64(const std::string &data) {
 	static const char table[] =
 		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 	std::string result;
-	result.reserve((data.size() + 2) / 3 * 4); // 预分配内存，提升性能
+	result.reserve((data.size() + 2) / 3 * 4);
 	for (size_t i = 0; i < data.size(); i += 3) {
 		const unsigned int value =
 			(static_cast<unsigned char>(data[i]) << 16) |
@@ -500,6 +499,21 @@ static std::string gltf_base64(const std::string &data) {
 		result += i + 2 < data.size() ? table[value & 63] : '=';
 	}
 	return result;
+}
+
+// MMD (Z-up) -> glTF (Y-up) 坐标转换
+static void convert_coordinate_mmd_to_gltf(float position[3]) {
+	float temp = position[1];
+	position[1] = position[2];
+	position[2] = temp;
+}
+
+// MMD 四元数转换 (Z-up -> Y-up)
+static void convert_quaternion_mmd_to_gltf(float quaternion[4]) {
+	// 交换 y 和 z 分量，并取反其中一个以保持手性
+	float temp = quaternion[1];
+	quaternion[1] = -quaternion[2];
+	quaternion[2] = temp;
 }
 
 static bool end_gltf_export() {
@@ -518,8 +532,6 @@ static bool end_gltf_export() {
 	const int pmd_num = ExpGetPmdNum();
 	const float fps = static_cast<float>(BridgeParameter::instance().export_fps);
 	const int start_frame = BridgeParameter::instance().start_frame;
-
-	// 使用 std::filesystem::path 替代 wchar_t MAX_PATH，彻底消除路径长度限制
 	std::map<std::filesystem::path, int> output_name_counts;
 
 	for (int i = 0; i < pmd_num; ++i) {
@@ -528,7 +540,6 @@ static bool end_gltf_export() {
 			continue;
 		}
 
-		// 与 VMD 导出保持一致：移除冗余关键帧并将起始帧归零。
 		const float bone_threshold = 0.0f;
 		auto get_bone_name = [](const vmd::VmdBoneFrame &frame) { return frame.name; };
 		auto are_bones_equal = [&](const vmd::VmdBoneFrame &a, const vmd::VmdBoneFrame &b) {
@@ -554,11 +565,7 @@ static bool end_gltf_export() {
 		file_data.vmd->bone_frames = PostProcessKeyframes(
 			file_data.vmd->bone_frames, get_bone_name, are_bones_equal, is_bone_zero);
 
-		// 【修复 1】删除了直接修改 frame.frame 的危险循环，避免无符号整数下溢。
-		// 偏移计算将统一在下方构建 times 时安全地进行。
-
-		// 【修复 2】建立从原始 bone_index 到连续 glTF node_index (0 到 N-1) 的显式映射
-		// 彻底解决骨骼索引不连续导致的 glTF node 数组越界和引用错误
+		// 创建骨骼索引到 glTF 节点索引的映射
 		std::map<int, int> bone_to_gltf_node;
 		int gltf_node_idx = 0;
 		for (const auto& pair : file_data.bone_name_map) {
@@ -583,18 +590,17 @@ static bool end_gltf_export() {
 		}
 
 		std::string binary;
-		struct Accessor
-		{
+		struct Accessor {
 			size_t offset;
 			size_t count;
 			const char* type;
-			size_t component_count; // 显式存储分量数，避免脆弱的字符串索引判断
+			size_t component_count;
 		};
 		std::vector<Accessor> accessors;
 
 		auto add_accessor = [&](const std::vector<float>& values, const char* type) {
 			while ((binary.size() & 3) != 0) {
-				binary.push_back('\0'); // glTF 要求 bufferView 4字节对齐
+				binary.push_back('\0');
 			}
 			const size_t offset = binary.size();
 			binary.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));
@@ -603,7 +609,7 @@ static bool end_gltf_export() {
 			std::string_view type_str(type);
 			if (type_str == "VEC3") components = 3;
 			else if (type_str == "VEC4") components = 4;
-			// 若未来支持 MAT4，可在此添加: else if (type_str == "MAT4") components = 16;
+			else if (type_str == "MAT4") components = 16;
 
 			accessors.push_back({ offset, values.size() / components, type, components });
 			return static_cast<int>(accessors.size() - 1);
@@ -612,7 +618,7 @@ static bool end_gltf_export() {
 		struct Channel {
 			int input;
 			int output;
-			int node; // 这里将存储映射后的 glTF node index
+			int node;
 			const char *path;
 		};
 		std::vector<Channel> channels;
@@ -626,15 +632,26 @@ static bool end_gltf_export() {
 			std::vector<float> rotations;
 
 			for (const auto *frame: frames) {
-				// 【修复 1 续】安全的有符号转换，避免无符号下溢，并确保时间不为负
 				int adjusted_frame = static_cast<int>(frame->frame) - start_frame;
 				times.push_back(std::max(0, adjusted_frame) / fps);
-				translations.insert(translations.end(), frame->position, frame->position + 3);
-				rotations.insert(rotations.end(), frame->orientation, frame->orientation + 4);
+
+				// 转换坐标系：MMD -> glTF
+				float pos[3] = {frame->position[0], frame->position[1], frame->position[2]};
+				convert_coordinate_mmd_to_gltf(pos);
+				translations.insert(translations.end(), pos, pos + 3);
+
+				// 转换四元数
+				float rot[4] = {
+					frame->orientation[0],
+					frame->orientation[1],
+					frame->orientation[2],
+					frame->orientation[3]
+				};
+				convert_quaternion_mmd_to_gltf(rot);
+				rotations.insert(rotations.end(), rot, rot + 4);
 			}
 
 			const int input = add_accessor(times, "SCALAR");
-			// 【修复 2 续】使用映射后的连续 node 索引
 			const int gltf_node = bone_to_gltf_node[bone_index];
 			channels.push_back({input, add_accessor(translations, "VEC3"), gltf_node, "translation"});
 			channels.push_back({input, add_accessor(rotations, "VEC4"), gltf_node, "rotation"});
@@ -652,7 +669,6 @@ static bool end_gltf_export() {
 		wcscpy_s(filename, MAX_PATH, source_name.c_str());
 		PathRenameExtensionW(filename, L".gltf");
 
-		// 【修复 4】安全的文件重名处理，防止原本带有 "(2)" 的文件名导致计数混乱和意外覆盖
 		std::wstring base_name = filename;
 		size_t dot_pos = base_name.find_last_of(L'.');
 		std::wstring name_without_ext = (dot_pos != std::wstring::npos) ? base_name.substr(0, dot_pos) : base_name;
@@ -663,27 +679,13 @@ static bool end_gltf_export() {
 			count++;
 			final_name = name_without_ext + L" (" + std::to_wstring(count + 1) + L").gltf";
 		}
-		output_name_counts[final_name] = 1; // 标记为已占用
+		output_name_counts[final_name] = 1;
 
 		wchar_t output_path[MAX_PATH];
 		PathCombineW(output_path, archive.output_path.c_str(), final_name.c_str());
 
-		std::ostringstream json;
-		json << std::setprecision(9);
-		json << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"mmdbridge\"},\"scene\":0,\"scenes\":[{\"nodes\":[";
-
-		bool first_root = true;
-		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
-			if (file_data.parent_index_map.at(bone_index) < 0) {
-				if (!first_root) json << ',';
-				// 【修复 2 续】使用映射后的索引作为场景根节点
-				json << bone_to_gltf_node[bone_index];
-				first_root = false;
-			}
-		}
-		json << "]}],\"nodes\":[";
-
-		// 【修复 3】增加防御性检查，防止 pmd 和 pmx 指针同时为空导致崩溃
+		// 计算骨骼位置
+		std::map<int, float[3]> bone_positions;
 		auto get_bone_position = [&](int bone_index, float position[3]) {
 			if (file_data.pmd) {
 				const pmd::PmdBone &bone = file_data.pmd->bones[bone_index];
@@ -696,30 +698,86 @@ static bool end_gltf_export() {
 				position[1] = bone.position[1];
 				position[2] = bone.position[2];
 			} else {
-				// 极端情况下的安全回退
 				position[0] = position[1] = position[2] = 0.0f;
 			}
+			convert_coordinate_mmd_to_gltf(position);
 		};
 
+		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
+			get_bone_position(bone_index, bone_positions[bone_index]);
+		}
+
+		// 【关键修复】添加一个虚拟 mesh 和 skin，让 Blender 识别为骨骼动画
+		// 创建一个单顶点的 mesh，权重分配到所有骨骼
+		size_t bone_count = file_data.bone_name_map.size();
+		std::vector<float> mesh_positions = {0.0f, 0.0f, 0.0f}; // 单个顶点在原点
+		std::vector<float> mesh_normals = {0.0f, 1.0f, 0.0f}; // 法线向上
+
+		// 顶点权重：每个骨骼权重为 1/bone_count
+		std::vector<float> mesh_weights;
+		std::vector<int> mesh_joints;
+		float weight_per_bone = 1.0f / bone_count;
+		for (size_t j = 0; j < bone_count; ++j) {
+			mesh_weights.push_back(weight_per_bone);
+			mesh_joints.push_back(static_cast<int>(j));
+		}
+
+		// 添加 mesh 数据到 binary
+		int mesh_pos_accessor = add_accessor(mesh_positions, "VEC3");
+		int mesh_norm_accessor = add_accessor(mesh_normals, "VEC3");
+		int mesh_weights_accessor = add_accessor(mesh_weights, "SCALAR");
+
+		// joints 需要是 VEC4 类型（4个关节索引）
+		std::vector<float> mesh_joints_vec4;
+		for (size_t j = 0; j < bone_count; ++j) {
+			mesh_joints_vec4.push_back(static_cast<float>(mesh_joints[j]));
+		}
+		// 填充到4的倍数
+		while (mesh_joints_vec4.size() % 4 != 0) {
+			mesh_joints_vec4.push_back(0.0f);
+		}
+		int mesh_joints_accessor = add_accessor(mesh_joints_vec4, "VEC4");
+
+		// 添加 inverse bind matrices（identity 矩阵）
+		std::vector<float> ibm_data;
+		for (size_t bone_idx = 0; bone_idx < bone_count; ++bone_idx) {
+			ibm_data.insert(ibm_data.end(), {
+				1.0f, 0.0f, 0.0f, 0.0f,
+				0.0f, 1.0f, 0.0f, 0.0f,
+				0.0f, 0.0f, 1.0f, 0.0f,
+				0.0f, 0.0f, 0.0f, 1.0f
+			});
+		}
+		int ibm_accessor = add_accessor(ibm_data, "MAT4");
+
+		std::ostringstream json;
+		json << std::setprecision(9);
+		json << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"mmdbridge\"},\"scene\":0,\"scenes\":[{\"nodes\":[";
+
+		// 场景根节点引用 mesh 节点（索引为 bone_count，因为骨骼节点是 0 到 bone_count-1）
+		json << bone_count; // mesh 节点的索引
+		json << "]}],\"nodes\":[";
+
+		// 骨骼节点
 		bool first_node = true;
-		// 直接遍历 map，保证生成的 nodes 数组索引 (0, 1, 2...) 与 bone_to_gltf_node 的值严格一致
 		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
 			if (!first_node) json << ',';
 			first_node = false;
 
 			float position[3];
-			float parent_position[3] = {0.0f, 0.0f, 0.0f};
-			get_bone_position(bone_index, position);
+			memcpy(position, bone_positions[bone_index], sizeof(float) * 3);
 
 			const int parent_index = file_data.parent_index_map.at(bone_index);
 			if (parent_index >= 0) {
-				get_bone_position(parent_index, parent_position);
+				float parent_position[3];
+				memcpy(parent_position, bone_positions[parent_index], sizeof(float) * 3);
+				position[0] -= parent_position[0];
+				position[1] -= parent_position[1];
+				position[2] -= parent_position[2];
 			}
 
 			json << "{\"name\":\"" << gltf_escape(bone_name) << "\",\"translation\":[" <<
-				position[0] - parent_position[0] << ',' <<
-				position[1] - parent_position[1] << ',' <<
-				position[2] - parent_position[2] << ']';
+				position[0] << ',' << position[1] << ',' << position[2] << ']';
 
 			bool first_child = true;
 			for (const auto &[child_bone_index, child_name]: file_data.bone_name_map) {
@@ -730,7 +788,6 @@ static bool end_gltf_export() {
 					} else {
 						json << ',';
 					}
-					// 【修复 2 续】children 数组中必须使用映射后的 glTF node 索引
 					json << bone_to_gltf_node[child_bone_index];
 				}
 			}
@@ -738,17 +795,36 @@ static bool end_gltf_export() {
 			json << '}';
 		}
 
-		json << "],\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," <<
+		// 添加 mesh 节点（包含 skin 引用）
+		json << ",{\"name\":\"Mesh\",\"mesh\":0,\"skin\":0}]";
+
+		// Meshes
+		json << ",\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":" << mesh_pos_accessor <<
+			",\"NORMAL\":" << mesh_norm_accessor << ",\"JOINTS_0\":" << mesh_joints_accessor <<
+			",\"WEIGHTS_0\":" << mesh_weights_accessor << "},\"mode\":0}]}]";
+
+		// Skins
+		json << ",\"skins\":[{\"inverseBindMatrices\":" << ibm_accessor << ",\"joints\":[";
+		bool first_joint = true;
+		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
+			if (!first_joint) json << ',';
+			first_joint = false;
+			json << bone_to_gltf_node[bone_index];
+		}
+		json << "]}]";
+
+		// Buffers
+		json << ",\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," <<
 			gltf_base64(binary) << "\",\"byteLength\":" << binary.size() << "}],\"bufferViews\":[";
 
 		for (size_t index = 0; index < accessors.size(); ++index) {
 			if (index != 0) json << ',';
-			// 【修复 3 续】直接使用结构体中已计算好的安全字段，摒弃脆弱的字符串索引判断
 			const size_t component_count = accessors[index].component_count;
 			json << "{\"buffer\":0,\"byteOffset\":" << accessors[index].offset <<
 				",\"byteLength\":" << accessors[index].count * component_count * sizeof(float) << '}';
 		}
 
+		// Accessors
 		json << "],\"accessors\":[";
 		for (size_t index = 0; index < accessors.size(); ++index) {
 			if (index != 0) json << ',';
@@ -756,6 +832,7 @@ static bool end_gltf_export() {
 				accessors[index].count << ",\"type\":\"" << accessors[index].type << "\"}";
 		}
 
+		// Animations
 		json << "],\"animations\":[{\"name\":\"" << gltf_escape(file_data.vmd->model_name) <<
 			"\",\"samplers\":[";
 		for (size_t index = 0; index < channels.size(); ++index) {
