@@ -11,7 +11,12 @@
 #include "UMPath.h"
 
 #include <cmath>
+#include <algorithm>
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 #include <map>
+#include <sstream>
 #include <vector>
 
 #include <pybind11/pybind11.h>
@@ -449,6 +454,331 @@ static bool end_vmd_export()
 	}
 
 	VMDArchive::instance().end();
+	return true;
+}
+
+static std::string gltf_escape(const std::string& value)
+{
+	std::ostringstream stream;
+	for (unsigned char c : value) {
+		switch (c) {
+			case '\\': stream << "\\\\"; break;
+			case '"': stream << "\\\""; break;
+			case '\n': stream << "\\n"; break;
+			case '\r': stream << "\\r"; break;
+			case '\t': stream << "\\t"; break;
+			case '\b': stream << "\\b"; break; // 新增：退格符
+			case '\f': stream << "\\f"; break; // 新增：换页符
+			default:
+				if (c < 0x20) {
+					// 安全转义其他控制字符，防止生成非法 JSON
+					char buf[8];
+					snprintf(buf, sizeof(buf), "\\u%04x", static_cast<int>(c));
+					stream << buf;
+				} else {
+					stream << c;
+				}
+				break;
+		}
+	}
+	return stream.str();
+}
+
+static std::string gltf_base64(const std::string &data) {
+	static const char table[] =
+		"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+	std::string result;
+	result.reserve((data.size() + 2) / 3 * 4); // 预分配内存，提升性能
+	for (size_t i = 0; i < data.size(); i += 3) {
+		const unsigned int value =
+			(static_cast<unsigned char>(data[i]) << 16) |
+			(i + 1 < data.size() ? static_cast<unsigned char>(data[i + 1]) << 8 : 0) |
+			(i + 2 < data.size() ? static_cast<unsigned char>(data[i + 2]) : 0);
+		result += table[(value >> 18) & 63];
+		result += table[(value >> 12) & 63];
+		result += i + 1 < data.size() ? table[(value >> 6) & 63] : '=';
+		result += i + 2 < data.size() ? table[value & 63] : '=';
+	}
+	return result;
+}
+
+static bool end_gltf_export() {
+	VMDArchive &archive = VMDArchive::instance();
+	if (!archive.is_start_vmd_export_called) {
+		archive.end();
+		ShowFrameRangeConfigError();
+		return false;
+	}
+	if (archive.has_bone_name_error) {
+		archive.end();
+		ShowInvalidBoneNameError();
+		return false;
+	}
+
+	const int pmd_num = ExpGetPmdNum();
+	const float fps = static_cast<float>(BridgeParameter::instance().export_fps);
+	const int start_frame = BridgeParameter::instance().start_frame;
+
+	// 使用 std::filesystem::path 替代 wchar_t MAX_PATH，彻底消除路径长度限制
+	std::map<std::filesystem::path, int> output_name_counts;
+
+	for (int i = 0; i < pmd_num; ++i) {
+		FileDataForVMD &file_data = archive.data_list.at(i);
+		if (!file_data.vmd) {
+			continue;
+		}
+
+		// 与 VMD 导出保持一致：移除冗余关键帧并将起始帧归零。
+		const float bone_threshold = 0.0f;
+		auto get_bone_name = [](const vmd::VmdBoneFrame &frame) { return frame.name; };
+		auto are_bones_equal = [&](const vmd::VmdBoneFrame &a, const vmd::VmdBoneFrame &b) {
+			for (int j = 0; j < 3; ++j) {
+				if (std::abs(a.position[j] - b.position[j]) > bone_threshold)
+					return false;
+			}
+			for (int j = 0; j < 4; ++j) {
+				if (std::abs(a.orientation[j] - b.orientation[j]) > bone_threshold)
+					return false;
+			}
+			return true;
+		};
+		auto is_bone_zero = [&](const vmd::VmdBoneFrame &frame) {
+			return std::abs(frame.position[0]) <= bone_threshold &&
+			       std::abs(frame.position[1]) <= bone_threshold &&
+			       std::abs(frame.position[2]) <= bone_threshold &&
+			       std::abs(frame.orientation[0]) <= bone_threshold &&
+			       std::abs(frame.orientation[1]) <= bone_threshold &&
+			       std::abs(frame.orientation[2]) <= bone_threshold &&
+			       std::abs(frame.orientation[3] - 1.0f) <= bone_threshold;
+		};
+		file_data.vmd->bone_frames = PostProcessKeyframes(
+			file_data.vmd->bone_frames, get_bone_name, are_bones_equal, is_bone_zero);
+
+		// 偏移计算将统一在下方构建 times 时安全地进行。
+		// 建立从原始 bone_index 到连续 glTF node_index (0 到 N-1) 的显式映射
+		// 彻底解决骨骼索引不连续导致的 glTF node 数组越界和引用错误
+		std::map<int, int> bone_to_gltf_node;
+		int gltf_node_idx = 0;
+		for (const auto& pair : file_data.bone_name_map) {
+			bone_to_gltf_node[pair.first] = gltf_node_idx++;
+		}
+
+		std::map<int, std::vector<const vmd::VmdBoneFrame *> > frames_by_bone;
+		std::map<std::string, int> bone_index_by_name;
+		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
+			bone_index_by_name[bone_name] = bone_index;
+		}
+		for (const auto &frame: file_data.vmd->bone_frames) {
+			auto bone = bone_index_by_name.find(frame.name);
+			if (bone != bone_index_by_name.end()) {
+				frames_by_bone[bone->second].push_back(&frame);
+			}
+		}
+		for (auto &[bone_index, frames]: frames_by_bone) {
+			std::sort(frames.begin(), frames.end(), [](const auto *a, const auto *b) {
+				return a->frame < b->frame;
+			});
+		}
+
+		std::string binary;
+		struct Accessor
+		{
+			size_t offset;
+			size_t count;
+			const char* type;
+			size_t component_count; // 显式存储分量数，避免脆弱的字符串索引判断
+		};
+		std::vector<Accessor> accessors;
+
+		auto add_accessor = [&](const std::vector<float>& values, const char* type) {
+			while ((binary.size() & 3) != 0) {
+				binary.push_back('\0'); // glTF 要求 bufferView 4 字节对齐
+			}
+			const size_t offset = binary.size();
+			binary.append(reinterpret_cast<const char*>(values.data()), values.size() * sizeof(float));
+
+			size_t components = 1;
+			std::string_view type_str(type);
+			if (type_str == "VEC3") components = 3;
+			else if (type_str == "VEC4") components = 4;
+			// 若未来支持 MAT4，可在此添加: else if (type_str == "MAT4") components = 16;
+
+			accessors.push_back({ offset, values.size() / components, type, components });
+			return static_cast<int>(accessors.size() - 1);
+		};
+
+		struct Channel {
+			int input;
+			int output;
+			int node; // 这里将存储映射后的 glTF node index
+			const char *path;
+		};
+		std::vector<Channel> channels;
+
+		for (const auto &[bone_index, frames]: frames_by_bone) {
+			if (frames.empty()) {
+				continue;
+			}
+			std::vector<float> times;
+			std::vector<float> translations;
+			std::vector<float> rotations;
+
+			for (const auto *frame: frames) {
+				// 安全的有符号转换，避免无符号下溢，并确保时间不为负
+				int adjusted_frame = static_cast<int>(frame->frame) - start_frame;
+				times.push_back(std::max(0, adjusted_frame) / fps);
+				translations.insert(translations.end(), frame->position, frame->position + 3);
+				rotations.insert(rotations.end(), frame->orientation, frame->orientation + 4);
+			}
+
+			const int input = add_accessor(times, "SCALAR");
+			// 使用映射后的连续 node 索引
+			const int gltf_node = bone_to_gltf_node[bone_index];
+			channels.push_back({input, add_accessor(translations, "VEC3"), gltf_node, "translation"});
+			channels.push_back({input, add_accessor(rotations, "VEC4"), gltf_node, "rotation"});
+		}
+
+		const char *filepath = ExpGetPmdFilenameUtf8(i);
+		const std::wstring source_path = umbase::UMStringUtil::utf16_to_wstring(
+			umbase::UMStringUtil::utf8_to_utf16(filepath));
+		const std::wstring source_name = PathFindFileNameW(source_path.c_str());
+		if (source_name.empty()) {
+			continue;
+		}
+
+		wchar_t filename[MAX_PATH];
+		wcscpy_s(filename, MAX_PATH, source_name.c_str());
+		PathRenameExtensionW(filename, L".gltf");
+
+		// 安全的文件重名处理，防止原本带有 "(2)" 的文件名导致计数混乱和意外覆盖
+		std::wstring base_name = filename;
+		size_t dot_pos = base_name.find_last_of(L'.');
+		std::wstring name_without_ext = (dot_pos != std::wstring::npos) ? base_name.substr(0, dot_pos) : base_name;
+
+		std::wstring final_name = base_name;
+		int count = 0;
+		while (output_name_counts.find(final_name) != output_name_counts.end()) {
+			count++;
+			final_name = name_without_ext + L" (" + std::to_wstring(count + 1) + L").gltf";
+		}
+		output_name_counts[final_name] = 1; // 标记为已占用
+
+		wchar_t output_path[MAX_PATH];
+		PathCombineW(output_path, archive.output_path.c_str(), final_name.c_str());
+
+		std::ostringstream json;
+		json << std::setprecision(9);
+		json << "{\"asset\":{\"version\":\"2.0\",\"generator\":\"mmdbridge\"},\"scene\":0,\"scenes\":[{\"nodes\":[";
+
+		bool first_root = true;
+		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
+			if (file_data.parent_index_map.at(bone_index) < 0) {
+				if (!first_root) json << ',';
+				// 使用映射后的索引作为场景根节点
+				json << bone_to_gltf_node[bone_index];
+				first_root = false;
+			}
+		}
+		json << "]}],\"nodes\":[";
+
+		// 增加防御性检查，防止 pmd 和 pmx 指针同时为空导致崩溃
+		auto get_bone_position = [&](int bone_index, float position[3]) {
+			if (file_data.pmd) {
+				const pmd::PmdBone &bone = file_data.pmd->bones[bone_index];
+				position[0] = bone.bone_head_pos[0];
+				position[1] = bone.bone_head_pos[1];
+				position[2] = bone.bone_head_pos[2];
+			} else if (file_data.pmx) {
+				const pmx::PmxBone &bone = file_data.pmx->bones[bone_index];
+				position[0] = bone.position[0];
+				position[1] = bone.position[1];
+				position[2] = bone.position[2];
+			} else {
+				// 极端情况下的安全回退
+				position[0] = position[1] = position[2] = 0.0f;
+			}
+		};
+
+		bool first_node = true;
+		// 直接遍历 map，保证生成的 nodes 数组索引 (0, 1, 2...) 与 bone_to_gltf_node 的值严格一致
+		for (const auto &[bone_index, bone_name]: file_data.bone_name_map) {
+			if (!first_node) json << ',';
+			first_node = false;
+
+			float position[3];
+			float parent_position[3] = {0.0f, 0.0f, 0.0f};
+			get_bone_position(bone_index, position);
+
+			const int parent_index = file_data.parent_index_map.at(bone_index);
+			if (parent_index >= 0) {
+				get_bone_position(parent_index, parent_position);
+			}
+
+			json << "{\"name\":\"" << gltf_escape(bone_name) << "\",\"translation\":[" <<
+				position[0] - parent_position[0] << ',' <<
+				position[1] - parent_position[1] << ',' <<
+				position[2] - parent_position[2] << ']';
+
+			bool first_child = true;
+			for (const auto &[child_bone_index, child_name]: file_data.bone_name_map) {
+				if (file_data.parent_index_map.at(child_bone_index) == bone_index) {
+					if (first_child) {
+						json << ",\"children\":[";
+						first_child = false;
+					} else {
+						json << ',';
+					}
+					// children 数组中必须使用映射后的 glTF node 索引
+					json << bone_to_gltf_node[child_bone_index];
+				}
+			}
+			if (!first_child) json << ']';
+			json << '}';
+		}
+
+		json << "],\"buffers\":[{\"uri\":\"data:application/octet-stream;base64," <<
+			gltf_base64(binary) << "\",\"byteLength\":" << binary.size() << "}],\"bufferViews\":[";
+
+		for (size_t index = 0; index < accessors.size(); ++index) {
+			if (index != 0) json << ',';
+			// 直接使用结构体中已计算好的安全字段，摒弃脆弱的字符串索引判断
+			const size_t component_count = accessors[index].component_count;
+			json << "{\"buffer\":0,\"byteOffset\":" << accessors[index].offset <<
+				",\"byteLength\":" << accessors[index].count * component_count * sizeof(float) << '}';
+		}
+
+		json << "],\"accessors\":[";
+		for (size_t index = 0; index < accessors.size(); ++index) {
+			if (index != 0) json << ',';
+			json << "{\"bufferView\":" << index << ",\"componentType\":5126,\"count\":" <<
+				accessors[index].count << ",\"type\":\"" << accessors[index].type << "\"}";
+		}
+
+		json << "],\"animations\":[{\"name\":\"" << gltf_escape(file_data.vmd->model_name) <<
+			"\",\"samplers\":[";
+		for (size_t index = 0; index < channels.size(); ++index) {
+			if (index != 0) json << ',';
+			json << "{\"input\":" << channels[index].input << ",\"output\":" <<
+				channels[index].output << ",\"interpolation\":\"LINEAR\"}";
+		}
+
+		json << "],\"channels\":[";
+		for (size_t index = 0; index < channels.size(); ++index) {
+			if (index != 0) json << ',';
+			json << "{\"sampler\":" << index << ",\"target\":{\"node\":" <<
+				channels[index].node << ",\"path\":\"" << channels[index].path << "\"}}";
+		}
+		json << "}]}";
+
+		std::ofstream output(std::filesystem::path(output_path), std::ios::binary);
+		if (!output) {
+			archive.end();
+			return false;
+		}
+		output << json.str();
+	}
+
+	archive.end();
 	return true;
 }
 
@@ -1241,6 +1571,7 @@ PYBIND11_MODULE(mmdbridge_vmd, m)
 		  py::arg("export_morph_animation"),
 		  py::arg("export_vertex_morph_animation_only"));
 	m.def("end_vmd_export", end_vmd_export);
+	m.def("end_gltf_export", end_gltf_export);
 	m.def("execute_vmd_export", execute_vmd_export);
 }
 
